@@ -1,18 +1,84 @@
-import os
 import io
+import os
 from datetime import date, timedelta
 
 import pandas as pd
 import streamlit as st
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
 
-APP_TITLE = "PV Assistant PRO+"
+APP_TITLE = "PV Assistant Gabinet"
+DATA_FILE = "patients.csv"
 TARGET_HCT = 45.0
 MAX_SINGLE_PHLEB_ML = 300
-DATA_FILE = "patients.csv"
 
 
 # =========================
-# POMOCNICZE
+# SESSION STATE
+# =========================
+
+DEFAULTS = {
+    "patient_id": "",
+    "age": 55,
+    "sex": "M",
+    "weight": 80.0,
+    "height": 175.0,
+    "thrombosis_history": "nie",
+    "treatment_text": "",
+    "symptom_itch": False,
+    "symptom_headache": False,
+    "symptom_erythromelalgia": False,
+    "symptom_dizziness": False,
+    "symptom_micro": False,
+    "symptom_nightsweats": False,
+    "symptom_weightloss": False,
+}
+
+for i in range(4):
+    DEFAULTS[f"cbc_date_{i}"] = date.today()
+    DEFAULTS[f"cbc_hct_{i}"] = 45.0
+    DEFAULTS[f"cbc_hb_{i}"] = 15.0
+    DEFAULTS[f"cbc_wbc_{i}"] = 10.0
+    DEFAULTS[f"cbc_plt_{i}"] = 400.0
+    DEFAULTS[f"cbc_ldh_{i}"] = 250.0
+    DEFAULTS[f"cbc_uric_{i}"] = 6.0
+    DEFAULTS[f"cbc_ferr_{i}"] = 50.0
+    DEFAULTS[f"cbc_creat_{i}"] = 1.0
+    DEFAULTS[f"cbc_rdw_{i}"] = 13.0
+    DEFAULTS[f"cbc_b2m_{i}"] = 2.0
+
+for i in range(4):
+    DEFAULTS[f"ph_date_{i}"] = date.today()
+    DEFAULTS[f"ph_ml_{i}"] = 300
+
+
+def init_state():
+    for key, value in DEFAULTS.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def clear_form():
+    patient_id = st.session_state.get("patient_id", "")
+    for key, value in DEFAULTS.items():
+        st.session_state[key] = value
+    st.session_state["patient_id"] = patient_id
+    for temp_key in [
+        "analysis_ready",
+        "last_summary",
+        "last_quick",
+        "last_flags",
+        "last_drug_alerts",
+        "last_next_ml",
+        "last_note",
+    ]:
+        if temp_key in st.session_state:
+            del st.session_state[temp_key]
+    st.rerun()
+
+
+# =========================
+# HELPERS
 # =========================
 
 def safe_float(value):
@@ -51,9 +117,6 @@ def round_to_25(value):
 
 
 def estimate_blood_volume_liters(sex: str, height_cm, weight_kg):
-    """
-    Wzór Nadlera.
-    """
     if height_cm is None or weight_kg is None:
         return None
 
@@ -65,25 +128,6 @@ def estimate_blood_volume_liters(sex: str, height_cm, weight_kg):
     if sex == "K":
         return (0.3561 * (h ** 3)) + (0.03308 * w) + 0.1833
     return (0.3615 * (h ** 3)) + (0.03264 * w) + 0.3937
-
-
-def parse_treatment_flags(text: str):
-    t = (text or "").lower()
-    flags = {
-        "asa": any(x in t for x in ["asa", "acard", "aspir", "aspiryna"]),
-        "hydroxyurea": any(x in t for x in ["hydroksy", "hydroxy", "hu"]),
-        "interferon": any(x in t for x in ["interfer", "ropeg"]),
-        "ruxolitinib": any(x in t for x in ["ruxo", "jakavi"]),
-        "anticoagulant": any(
-            x in t for x in ["apiks", "apix", "eliquis", "rivar", "xarelto", "dabig", "warf", "acenok"]
-        ),
-        "allopurinol": "allopur" in t,
-        "statin": any(x in t for x in ["statyn", "atorwa", "rosuwa", "simwa"]),
-    }
-    flags["cytoreduction"] = (
-        flags["hydroxyurea"] or flags["interferon"] or flags["ruxolitinib"]
-    )
-    return flags
 
 
 def trend_label(values):
@@ -151,6 +195,46 @@ def persistent_above_target(values, n_needed=2):
     return all(v > TARGET_HCT for v in vals[-n_needed:])
 
 
+def parse_treatment_flags(text: str):
+    t = (text or "").lower()
+    flags = {
+        "asa": any(x in t for x in ["asa", "acard", "aspir", "aspiryna", "polopiryna"]),
+        "hydroxyurea": any(x in t for x in ["hydroksy", "hydroxy", "hu"]),
+        "interferon": any(x in t for x in ["interfer", "ropeg"]),
+        "ruxolitinib": any(x in t for x in ["ruxo", "jakavi"]),
+        "anticoagulant": any(
+            x in t for x in [
+                "apiks", "apix", "eliquis", "rivar", "xarelto",
+                "dabig", "pradaxa", "warf", "acenok", "antykoagul"
+            ]
+        ),
+        "allopurinol": "allopur" in t,
+        "statin": any(x in t for x in ["statyn", "atorwa", "rosuwa", "simwa"]),
+    }
+    flags["cytoreduction"] = (
+        flags["hydroxyurea"] or flags["interferon"] or flags["ruxolitinib"]
+    )
+    return flags
+
+
+def build_drug_alerts(treatment_flags, current_plt):
+    alerts = []
+
+    if treatment_flags["asa"] and treatment_flags["anticoagulant"]:
+        alerts.append("ASA + antykoagulant: zwiększone ryzyko krwawienia.")
+
+    if treatment_flags["ruxolitinib"]:
+        alerts.append("Ruxolitinib: sprawdź potencjalne interakcje z silnymi inhibitorami CYP3A4.")
+
+    if treatment_flags["anticoagulant"]:
+        alerts.append("Antykoagulant: sprawdź interakcje z inhibitorami i induktorami CYP3A4/P-gp.")
+
+    if current_plt is not None and current_plt >= 1000 and treatment_flags["asa"]:
+        alerts.append("PLT ≥1000 i ASA: rozważ ocenę ryzyka nabytego vWD.")
+
+    return alerts
+
+
 def estimate_next_phleb_ml(
     current_hct,
     current_hb,
@@ -163,12 +247,6 @@ def estimate_next_phleb_ml(
     treatment_flags,
     avg_phleb_interval,
 ):
-    """
-    Model roboczy:
-    objętość do osiągnięcia Hct 45% liczona z EBV:
-    V = EBV * (Hct_i - Hct_target) / Hct_i
-    potem korekty kliniczne i limit 300 ml.
-    """
     if current_hct is None or current_hct <= TARGET_HCT or ebv_liters is None:
         return 0
 
@@ -233,13 +311,13 @@ def assess_cytoreduction_need(age, thrombosis_history, treatment_flags, cbc_rows
         reasons.append("utrzymywanie Hct >45% w kolejnych badaniach")
 
     if len(recent_hct) >= 3 and all(v > TARGET_HCT for v in recent_hct[-3:]):
-        reasons.append("utrwalony brak kontroli Hct w serii badań")
+        reasons.append("utrwalony brak kontroli Hct")
 
     if avg_phleb_interval is not None and avg_phleb_interval <= 42:
         reasons.append("częsta potrzeba upustów")
 
     if len(recent_wbc) >= 2 and max(recent_wbc[-2:]) > 15:
-        reasons.append("utrzymująca się leukocytoza >15 x10^9/l")
+        reasons.append("utrzymująca się leukocytoza >15")
 
     if len(recent_plt) >= 2 and max(recent_plt[-2:]) >= 1000:
         reasons.append("bardzo wysokie PLT")
@@ -251,37 +329,163 @@ def assess_cytoreduction_need(age, thrombosis_history, treatment_flags, cbc_rows
 
     if treatment_flags["cytoreduction"]:
         if reasons:
-            conclusion = "obraz przemawia za oceną skuteczności lub optymalizacji leczenia cytoredukcyjnego"
+            conclusion = "obraz przemawia za oceną skuteczności lub optymalizacji cytoredukcji"
         else:
-            conclusion = "brak silnych przesłanek do zmiany cytoredukcji w tym uproszczonym modelu"
+            conclusion = "brak silnych przesłanek do zmiany cytoredukcji w tym modelu"
     else:
         if reasons:
-            conclusion = "obraz przemawia za rozważeniem leczenia cytoredukcyjnego"
+            conclusion = "obraz przemawia za rozważeniem cytoredukcji"
         else:
-            conclusion = "brak wyraźnych przesłanek do cytoredukcji w tym uproszczonym modelu"
+            conclusion = "brak wyraźnych przesłanek do cytoredukcji w tym modelu"
 
     return conclusion, reasons
 
 
-def build_drug_alerts(treatment_flags, current_plt):
-    alerts = []
+# =========================
+# HISTORY
+# =========================
 
-    if treatment_flags["asa"] and treatment_flags["anticoagulant"]:
-        alerts.append("ASA + antykoagulant: zwiększone ryzyko krwawienia.")
+def visit_to_record(data, summary, next_ml):
+    current = data["cbc_rows"][-1]
+    return {
+        "patient_id": data["patient_id"],
+        "visit_date": date.today().isoformat(),
+        "age": data["age"],
+        "sex": data["sex"],
+        "weight": data["weight"],
+        "height": data["height"],
+        "thrombosis_history": data["thrombosis_history"],
+        "treatment": data["treatment"],
+        "symptom_itch": data["symptoms"]["świąd"],
+        "symptom_headache": data["symptoms"]["ból_głowy"],
+        "symptom_erythromelalgia": data["symptoms"]["erytromelalgia"],
+        "symptom_dizziness": data["symptoms"]["zawroty"],
+        "symptom_micro": data["symptoms"]["mikrokrążenie"],
+        "symptom_nightsweats": data["symptoms"]["nocne_poty"],
+        "symptom_weightloss": data["symptoms"]["spadek_masy"],
+        "hct": current["hct"],
+        "hb": current["hb"],
+        "wbc": current["wbc"],
+        "plt": current["plt"],
+        "ldh": current["ldh"],
+        "uric_acid": current["uric_acid"],
+        "ferritin": current["ferritin"],
+        "creatinine": current["creatinine"],
+        "rdw": current["rdw"],
+        "beta2m": current["beta2m"],
+        "next_ml": next_ml,
+        "summary": summary,
+    }
 
-    if treatment_flags["ruxolitinib"]:
-        alerts.append("Ruxolitinib: sprawdź potencjalne interakcje z silnymi inhibitorami CYP3A4.")
 
-    if treatment_flags["anticoagulant"]:
-        alerts.append("Antykoagulant: sprawdź interakcje z inhibitorami i induktorami CYP3A4/P-gp.")
+def append_visit_to_csv(record):
+    df = pd.DataFrame([record])
+    if os.path.exists(DATA_FILE):
+        old = pd.read_csv(DATA_FILE)
+        all_df = pd.concat([old, df], ignore_index=True)
+        all_df.to_csv(DATA_FILE, index=False)
+    else:
+        df.to_csv(DATA_FILE, index=False)
 
-    if current_plt is not None and current_plt >= 1000 and treatment_flags["asa"]:
-        alerts.append("PLT ≥1000 i ASA: rozważ ocenę ryzyka nabytego vWD.")
 
-    return alerts
+def load_patient_history(patient_id):
+    if not patient_id or not os.path.exists(DATA_FILE):
+        return pd.DataFrame()
+    df = pd.read_csv(DATA_FILE)
+    if "patient_id" not in df.columns:
+        return pd.DataFrame()
+    df = df[df["patient_id"].astype(str) == str(patient_id)]
+    if not df.empty and "visit_date" in df.columns:
+        df = df.sort_values("visit_date")
+    return df
 
 
-def build_summary(data):
+def compare_with_previous(history_df):
+    if history_df.empty or len(history_df) < 2:
+        return []
+    last = history_df.iloc[-1]
+    prev = history_df.iloc[-2]
+
+    lines = []
+    for col, label in [
+        ("hct", "Hct"),
+        ("hb", "Hb"),
+        ("wbc", "WBC"),
+        ("plt", "PLT"),
+        ("ldh", "LDH"),
+        ("uric_acid", "Kwas moczowy"),
+        ("ferritin", "Ferrytyna"),
+    ]:
+        try:
+            diff = float(last[col]) - float(prev[col])
+            lines.append(f"{label}: {diff:+.2f}")
+        except Exception:
+            pass
+    return lines
+
+
+# =========================
+# PDF
+# =========================
+
+def wrap_text(text, width, font_name="Helvetica", font_size=10):
+    lines = []
+    for paragraph in text.split("\n"):
+        words = paragraph.split()
+        if not words:
+            lines.append("")
+            continue
+
+        current = words[0]
+        for word in words[1:]:
+            test = current + " " + word
+            if string_width(test, font_name, font_size) <= width:
+                current = test
+            else:
+                lines.append(current)
+                current = word
+        lines.append(current)
+    return lines
+
+
+def string_width(text, font_name="Helvetica", font_size=10):
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    return stringWidth(text, font_name, font_size)
+
+
+def make_pdf_bytes(title, body):
+    buffer = io.BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=A4)
+    page_width, page_height = A4
+    margin = 40
+    y = page_height - 40
+
+    pdf.setFont("Helvetica-Bold", 14)
+    pdf.drawString(margin, y, title)
+    y -= 24
+
+    pdf.setFont("Helvetica", 10)
+    max_width = page_width - 2 * margin
+    lines = wrap_text(body, max_width, "Helvetica", 10)
+
+    for line in lines:
+        if y < 50:
+            pdf.showPage()
+            pdf.setFont("Helvetica", 10)
+            y = page_height - 40
+        pdf.drawString(margin, y, line)
+        y -= 14
+
+    pdf.save()
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+# =========================
+# MAIN ANALYSIS
+# =========================
+
+def build_analysis(data):
     bmi = bmi_calc(data["weight"], data["height"])
     treatment_flags = parse_treatment_flags(data["treatment"])
     cbc_rows = data["cbc_rows"]
@@ -295,9 +499,6 @@ def build_summary(data):
     current_ldh = current["ldh"]
     current_uric = current["uric_acid"]
     current_ferritin = current["ferritin"]
-    current_creat = current["creatinine"]
-    current_rdw = current["rdw"]
-    current_b2m = current["beta2m"]
 
     dates = [r["date"] for r in cbc_rows]
     hct_vals = [r["hct"] for r in cbc_rows]
@@ -311,8 +512,6 @@ def build_summary(data):
     plt_trend = trend_label(plt_vals)
 
     hct_slope = last_two_monthly_slope(hct_vals, dates)
-    hb_slope = last_two_monthly_slope(hb_vals, dates)
-
     avg_interval = average_phleb_interval_days(phleb_rows)
     ebv_liters = estimate_blood_volume_liters(data["sex"], data["height"], data["weight"])
 
@@ -352,527 +551,380 @@ def build_summary(data):
 
     drug_alerts = build_drug_alerts(treatment_flags, current_plt)
 
-    recognized = []
-    if treatment_flags["asa"]:
-        recognized.append("ASA")
-    if treatment_flags["hydroxyurea"]:
-        recognized.append("hydroksymocznik")
-    if treatment_flags["interferon"]:
-        recognized.append("interferon")
-    if treatment_flags["ruxolitinib"]:
-        recognized.append("ruxolitinib")
-    if treatment_flags["anticoagulant"]:
-        recognized.append("antykoagulant")
-    if treatment_flags["allopurinol"]:
-        recognized.append("allopurinol")
-    if treatment_flags["statin"]:
-        recognized.append("statyna")
-
     flags = []
     if data["thrombosis_history"] == "tak":
-        flags.append("przebyta zakrzepica")
+        flags.append("Przebyta zakrzepica")
     if data["age"] >= 60:
-        flags.append("wiek ≥60 lat")
+        flags.append("Wiek ≥60 lat")
     if persistent_above_target(hct_vals, 2):
-        flags.append("kolejne Hct >45%")
+        flags.append("Kolejne Hct >45%")
     if avg_interval is not None and avg_interval <= 42:
-        flags.append("częsta potrzeba upustów")
+        flags.append("Częsta potrzeba upustów")
     if current_wbc is not None and current_wbc > 15:
         flags.append("WBC >15 x10^9/l")
     if current_plt is not None and current_plt >= 1000:
         flags.append("PLT ≥1000 x10^9/l")
     if symptom_burden >= 2:
-        flags.append("istotne obciążenie objawami")
+        flags.append("Istotne obciążenie objawami")
     if current_ferritin is not None and current_ferritin < 30:
-        flags.append("niska ferrytyna")
+        flags.append("Niska ferrytyna")
     if current_uric is not None and current_uric > 7:
-        flags.append("podwyższony kwas moczowy")
-
-    problems = []
-    if current_hct is not None and current_hct > TARGET_HCT:
-        problems.append("Hct powyżej celu")
-    if avg_interval is not None and avg_interval <= 42:
-        problems.append("częsta potrzeba upustów")
-    if current_wbc is not None and current_wbc > 15:
-        problems.append("leukocytoza")
-    if current_plt is not None and current_plt >= 1000:
-        problems.append("bardzo wysokie PLT")
-    if symptom_burden >= 2:
-        problems.append("nasilone objawy")
-    if current_ferritin is not None and current_ferritin < 30:
-        problems.append("niedobór żelaza / niska ferrytyna")
-    if current_uric is not None and current_uric > 7:
-        problems.append("hiperurykemia")
+        flags.append("Podwyższony kwas moczowy")
 
     recommendations = []
     if current_hct is not None and current_hct > TARGET_HCT:
-        recommendations.append("utrzymywać fokus na osiągnięciu Hct <45%")
+        recommendations.append("Rozważyć intensyfikację kontroli Hct do celu <45%.")
     if next_ml > 0:
-        recommendations.append(f"rozważyć pojedynczy kolejny upust około {next_ml} ml")
+        recommendations.append(f"Orientacyjny pojedynczy kolejny upust do rozważenia: {next_ml} ml.")
     if current_ferritin is not None and current_ferritin < 30:
-        recommendations.append("ocenić stopień niedoboru żelaza w kontekście częstych upustów")
+        recommendations.append("Ocenić niedobór żelaza w kontekście częstych upustów.")
     if current_uric is not None and current_uric > 7:
-        recommendations.append("uwzględnić kontrolę kwasu moczowego i ryzyka dny")
-    if current_wbc is not None and current_wbc > 15:
-        recommendations.append("ocenić skuteczność obecnej strategii kontroli choroby")
-    if current_plt is not None and current_plt >= 1000:
-        recommendations.append("zweryfikować bezpieczeństwo strategii przeciwpłytkowej")
+        recommendations.append("Rozważyć kontrolę hiperurykemii.")
+    if current_ldh is not None and current_ldh > 250:
+        recommendations.append("Podwyższone LDH wymaga oceny w kontekście aktywności choroby.")
     if cyto_reasons:
         recommendations.append(cyto_conclusion)
 
-    lines = []
-    lines.append("PODSUMOWANIE LEKARSKIE")
-    lines.append("=" * 74)
-    lines.append("")
-    lines.append("Dane podstawowe")
-    lines.append(f"Pacjent / ID: {data['patient_id'] or 'brak danych'}")
-    lines.append(f"Wiek: {data['age']}")
-    lines.append(f"Płeć: {data['sex']}")
-    lines.append(
-        f"Masa / wzrost: "
-        f"{data['weight'] if data['weight'] is not None else 'brak'} kg / "
-        f"{data['height'] if data['height'] is not None else 'brak'} cm"
+    summary_lines = []
+    summary_lines.append("PODSUMOWANIE LEKARSKIE")
+    summary_lines.append("=" * 70)
+    summary_lines.append("")
+    summary_lines.append(f"Pacjent / ID: {data['patient_id'] or 'brak danych'}")
+    summary_lines.append(f"Wiek: {data['age']}")
+    summary_lines.append(f"Płeć: {data['sex']}")
+    summary_lines.append(
+        f"Masa / wzrost: {data['weight']} kg / {data['height']} cm | "
+        f"BMI: {bmi:.1f} ({bmi_class(bmi)})" if bmi is not None else "BMI: brak danych"
     )
-    lines.append(
-        f"BMI: {f'{bmi:.1f}' if bmi is not None else 'brak danych'} "
-        f"({bmi_class(bmi)})"
+    summary_lines.append(f"Zakrzepica w wywiadzie: {data['thrombosis_history']}")
+    summary_lines.append("")
+    summary_lines.append("Aktualne leczenie")
+    summary_lines.append(data["treatment"] if data["treatment"] else "brak danych")
+    summary_lines.append("")
+    summary_lines.append("Aktualne parametry")
+    summary_lines.append(
+        f"Hct {current_hct}, Hb {current_hb}, WBC {current_wbc}, PLT {current_plt}, "
+        f"LDH {current_ldh}, kwas moczowy {current_uric}, ferrytyna {current_ferritin}"
     )
-    lines.append(
-        f"Szacowana objętość krwi: "
-        f"{f'{ebv_liters:.2f} l' if ebv_liters is not None else 'brak danych'}"
+    summary_lines.append("")
+    summary_lines.append("Trendy")
+    summary_lines.append(f"Hct: {hct_trend}")
+    summary_lines.append(f"Hb: {hb_trend}")
+    summary_lines.append(f"WBC: {wbc_trend}")
+    summary_lines.append(f"PLT: {plt_trend}")
+    summary_lines.append(
+        f"Tempo zmiany Hct: {hct_slope:.2f} % / mies." if hct_slope is not None else "Tempo zmiany Hct: za mało danych"
     )
-    lines.append("")
-    lines.append("Ryzyko klasyczne")
-    if data["thrombosis_history"] == "tak" or data["age"] >= 60:
-        lines.append("Pacjent spełnia klasyczne kryteria wysokiego ryzyka zakrzepowego.")
-    else:
-        lines.append("Pacjent nie spełnia klasycznych kryteriów wysokiego ryzyka zakrzepowego.")
-    lines.append(f"Zakrzepica w wywiadzie: {data['thrombosis_history']}")
-    lines.append("")
-    lines.append("Leczenie")
-    lines.append(data["treatment"] if data["treatment"] else "brak danych")
-    if recognized:
-        lines.append("Rozpoznane leczenie: " + ", ".join(recognized))
-    lines.append("")
-    lines.append("Objawy")
-    symptom_labels = [k.replace("_", " ") for k, v in data["symptoms"].items() if v]
-    lines.append(", ".join(symptom_labels) if symptom_labels else "brak zaznaczonych objawów")
-    lines.append(f"Obciążenie objawami w uproszczonym modelu: {symptom_burden}")
-    lines.append("")
-    lines.append("Kolejne badania")
-    for i, row in enumerate(cbc_rows, start=1):
-        lines.append(
-            f"{i}) {row['date'].isoformat()} | "
-            f"Hct: {row['hct'] if row['hct'] is not None else 'brak'} | "
-            f"Hb: {row['hb'] if row['hb'] is not None else 'brak'} | "
-            f"WBC: {row['wbc'] if row['wbc'] is not None else 'brak'} | "
-            f"PLT: {row['plt'] if row['plt'] is not None else 'brak'} | "
-            f"LDH: {row['ldh'] if row['ldh'] is not None else 'brak'} | "
-            f"Kwas moczowy: {row['uric_acid'] if row['uric_acid'] is not None else 'brak'} | "
-            f"Ferrytyna: {row['ferritin'] if row['ferritin'] is not None else 'brak'} | "
-            f"Kreatynina: {row['creatinine'] if row['creatinine'] is not None else 'brak'} | "
-            f"RDW: {row['rdw'] if row['rdw'] is not None else 'brak'} | "
-            f"B2M: {row['beta2m'] if row['beta2m'] is not None else 'brak'}"
-        )
-    lines.append("")
-    lines.append("Ocena trendów")
-    lines.append(f"Hct: {hct_trend}")
-    lines.append(f"Hb: {hb_trend}")
-    lines.append(f"WBC: {wbc_trend}")
-    lines.append(f"PLT: {plt_trend}")
-    lines.append(
-        f"Tempo zmiany Hct z 2 ostatnich badań: "
-        f"{f'{hct_slope:.2f} % / mies.' if hct_slope is not None else 'za mało danych'}"
-    )
-    lines.append(
-        f"Tempo zmiany Hb z 2 ostatnich badań: "
-        f"{f'{hb_slope:.2f} g/dl / mies.' if hb_slope is not None else 'za mało danych'}"
-    )
-    lines.append("")
-    lines.append("Daty upustów")
-    if phleb_rows:
-        for i, row in enumerate(phleb_rows, start=1):
-            lines.append(
-                f"{i}) {row['date'].isoformat()} | "
-                f"objętość: {row['ml'] if row['ml'] is not None else 'brak'} ml"
-            )
-        lines.append(f"Ocena częstości upustów: {phleb_frequency_text(avg_interval)}")
-    else:
-        lines.append("Brak danych o upustach.")
-    lines.append("")
-    lines.append("PROBLEM")
-    if problems:
-        for p in problems:
-            lines.append(f"• {p}")
-    else:
-        lines.append("• brak istotnych problemów w tym modelu")
-    lines.append("")
-    lines.append("WNIOSKI")
-    if current_hct is not None and current_hct <= TARGET_HCT:
-        lines.append(f"Aktualny Hct {current_hct:.1f}% jest w celu terapeutycznym <45%.")
-    elif current_hct is not None:
-        lines.append(f"Aktualny Hct {current_hct:.1f}% pozostaje powyżej celu terapeutycznego <45%.")
-
-    if next_ml > 0:
-        lines.append(
-            f"Orientacyjna objętość jednego kolejnego upustu do rozważenia: {next_ml} ml "
-            f"(maks. {MAX_SINGLE_PHLEB_ML} ml w tym modelu)."
-        )
-    else:
-        lines.append("Na podstawie aktualnego Hct orientacyjny kolejny upust do rozważenia: 0 ml.")
-
+    summary_lines.append("")
+    summary_lines.append("Upusty")
+    summary_lines.append(phleb_frequency_text(avg_interval))
     if days_to_recross is not None:
         if current_hct < TARGET_HCT and days_to_recross > 0:
             est_date = date.today() + timedelta(days=days_to_recross)
-            lines.append(
-                f"Przy utrzymaniu obecnego tempa wzrostu Hct próg 45% może zostać przekroczony "
-                f"za około {days_to_recross} dni, orientacyjnie około {est_date.isoformat()}."
+            summary_lines.append(
+                f"Przy obecnym tempie Hct może przekroczyć 45% za około {days_to_recross} dni, około {est_date.isoformat()}."
             )
         elif current_hct >= TARGET_HCT:
-            lines.append("Hct już pozostaje na poziomie co najmniej 45%.")
-    else:
-        lines.append("Nie udało się wiarygodnie oszacować czasu do ponownego przekroczenia 45%.")
-    lines.append("")
-    lines.append("UZASADNIENIE")
+            summary_lines.append("Hct aktualnie już pozostaje na poziomie co najmniej 45%.")
+    summary_lines.append("")
+    summary_lines.append("Czerwone flagi")
     if flags:
-        for f in flags:
-            lines.append(f"• {f}")
+        for item in flags:
+            summary_lines.append(f"• {item}")
     else:
-        lines.append("• brak dodatkowych flag w tym modelu")
-    lines.append("")
-    lines.append("ZALECENIA ROBOCZE")
-    if recommendations:
-        for r in recommendations:
-            lines.append(f"• {r}")
-    else:
-        lines.append("• utrzymać bieżący nadzór kliniczny")
-    lines.append("")
-    lines.append("OSTRZEŻENIA LEKOWE")
+        summary_lines.append("• brak istotnych flag")
+    summary_lines.append("")
+    summary_lines.append("Ostrzeżenia lekowe")
     if drug_alerts:
-        for a in drug_alerts:
-            lines.append(f"• {a}")
+        for item in drug_alerts:
+            summary_lines.append(f"• {item}")
     else:
-        lines.append("• brak istotnych ostrzeżeń wykrytych w tym prostym silniku")
-    lines.append("")
-    lines.append("Uwagi końcowe")
-    lines.append("• To narzędzie ma charakter wspomagający dla lekarza.")
-    lines.append("• Nie zastępuje pełnej oceny hematologicznej.")
-    lines.append("• Objętość upustu jest tylko szacunkiem roboczym.")
-    lines.append("• Ostateczna decyzja należy do lekarza prowadzącego.")
+        summary_lines.append("• brak istotnych ostrzeżeń w prostym silniku")
+    summary_lines.append("")
+    summary_lines.append("Zalecenia robocze")
+    if recommendations:
+        for item in recommendations:
+            summary_lines.append(f"• {item}")
+    else:
+        summary_lines.append("• utrzymać bieżący nadzór")
+    summary_lines.append("")
+    summary_lines.append("Uwagi")
+    summary_lines.append("To narzędzie ma charakter wspomagający dla lekarza.")
+    summary_lines.append("Nie zastępuje pełnej oceny klinicznej i decyzji terapeutycznej.")
 
-    quick = (
-        f"Aktualny Hct: {current_hct:.1f}% | kolejny upust do rozważenia: {next_ml} ml"
-        if current_hct is not None
-        else "Brak aktualnego Hct"
+    summary = "\n".join(summary_lines)
+
+    note = (
+        f"Wizyta kontrolna PV. Pacjent ID {data['patient_id'] or 'brak'}, wiek {data['age']} lat, "
+        f"zakrzepica w wywiadzie: {data['thrombosis_history']}. "
+        f"Aktualne leczenie: {data['treatment'] if data['treatment'] else 'brak danych'}. "
+        f"Badania: Hct {current_hct}, Hb {current_hb}, WBC {current_wbc}, PLT {current_plt}, "
+        f"LDH {current_ldh}, kwas moczowy {current_uric}, ferrytyna {current_ferritin}. "
+        f"Orientacyjny kolejny upust do rozważenia: {next_ml} ml. "
+        f"Ocena cytoredukcji: {cyto_conclusion}. "
+        f"Flagi: {', '.join(flags) if flags else 'brak istotnych flag'}. "
+        f"Decyzja terapeutyczna po pełnej ocenie klinicznej."
     )
 
-    return "\n".join(lines), quick, current_hct, next_ml, flags, drug_alerts
+    quick = f"Hct {current_hct:.1f}% | upust do rozważenia {next_ml} ml" if current_hct is not None else "Brak Hct"
 
-
-def visit_to_record(data, summary, next_ml):
-    current = data["cbc_rows"][-1]
-    record = {
-        "patient_id": data["patient_id"],
-        "visit_date": date.today().isoformat(),
-        "age": data["age"],
-        "sex": data["sex"],
-        "weight": data["weight"],
-        "height": data["height"],
-        "thrombosis_history": data["thrombosis_history"],
-        "treatment": data["treatment"],
-        "symptom_itch": data["symptoms"]["świąd"],
-        "symptom_headache": data["symptoms"]["ból_głowy"],
-        "symptom_erythromelalgia": data["symptoms"]["erytromelalgia"],
-        "symptom_dizziness": data["symptoms"]["zawroty"],
-        "symptom_micro": data["symptoms"]["mikrokrążenie"],
-        "symptom_nightsweats": data["symptoms"]["nocne_poty"],
-        "symptom_weightloss": data["symptoms"]["spadek_masy"],
-        "hct": current["hct"],
-        "hb": current["hb"],
-        "wbc": current["wbc"],
-        "plt": current["plt"],
-        "ldh": current["ldh"],
-        "uric_acid": current["uric_acid"],
-        "ferritin": current["ferritin"],
-        "creatinine": current["creatinine"],
-        "rdw": current["rdw"],
-        "beta2m": current["beta2m"],
-        "next_ml": next_ml,
+    return {
         "summary": summary,
+        "note": note,
+        "quick": quick,
+        "flags": flags,
+        "drug_alerts": drug_alerts,
+        "next_ml": next_ml,
+        "current_hct": current_hct,
+        "cyto_conclusion": cyto_conclusion,
     }
-    return record
 
 
-def append_visit_to_csv(record):
-    df = pd.DataFrame([record])
-    if os.path.exists(DATA_FILE):
-        old = pd.read_csv(DATA_FILE)
-        all_df = pd.concat([old, df], ignore_index=True)
-        all_df.to_csv(DATA_FILE, index=False)
-    else:
-        df.to_csv(DATA_FILE, index=False)
+# =========================
+# UI
+# =========================
 
-
-def load_patient_history(patient_id):
-    if not patient_id or not os.path.exists(DATA_FILE):
-        return pd.DataFrame()
-    df = pd.read_csv(DATA_FILE)
-    if "patient_id" not in df.columns:
-        return pd.DataFrame()
-    df = df[df["patient_id"].astype(str) == str(patient_id)]
-    if not df.empty and "visit_date" in df.columns:
-        df = df.sort_values("visit_date")
-    return df
-
+st.set_page_config(page_title=APP_TITLE, layout="wide")
+init_state()
 
 st.title(APP_TITLE)
-st.caption("Wersja webowa dla lekarza")
+st.caption("Jedna logiczna karta wizyty")
 
-st.warning(
-    "To narzędzie ma charakter wspomagający dla lekarza. "
-    "Nie zastępuje pełnej oceny klinicznej ani decyzji terapeutycznej."
-)
+top1, top2, top3 = st.columns([2, 1, 1])
 
-tab_visit, tab_history, tab_treatment = st.tabs(["Wizyta", "Historia", "Leczenie i ostrzeżenia"])
+with top1:
+    st.text_input("ID pacjenta", key="patient_id")
 
-with tab_visit:
-    left, right = st.columns([1.05, 1.25])
+with top2:
+    st.button("Wyczyść formularz", on_click=clear_form, use_container_width=True)
 
-    with left:
-        st.subheader("Dane podstawowe")
+history_df = load_patient_history(st.session_state["patient_id"])
 
-        patient_id = st.text_input("Pacjent / ID", value="")
-        age = st.number_input("Wiek", min_value=0, max_value=120, value=55, step=1)
-        sex = st.selectbox("Płeć", ["M", "K", "inna / niepodano"])
-        weight = st.number_input("Masa ciała (kg)", min_value=20.0, max_value=300.0, value=80.0, step=1.0)
-        height = st.number_input("Wzrost (cm)", min_value=100.0, max_value=250.0, value=175.0, step=1.0)
-        thrombosis_history = st.selectbox("Zakrzepica w wywiadzie", ["nie", "tak"])
+with top3:
+    if not history_df.empty:
+        st.success(f"Historia: {len(history_df)} wizyt")
+    else:
+        st.info("Brak historii")
 
-        bmi = bmi_calc(weight, height)
-        st.info(f"BMI: {bmi:.1f} ({bmi_class(bmi)})" if bmi is not None else "BMI: brak danych")
+left, right = st.columns([1.05, 1.25])
 
-        treatment = st.text_area(
-            "Leczenie",
-            value="",
-            height=120,
-            placeholder="Np. ASA, hydroksymocznik, interferon, ruxolitinib, antykoagulant, allopurinol",
-        )
+with left:
+    st.subheader("Dane podstawowe")
 
-        st.subheader("Objawy")
-        s1, s2 = st.columns(2)
-        symptoms = {
-            "świąd": s1.checkbox("Świąd"),
-            "ból_głowy": s1.checkbox("Ból głowy"),
-            "erytromelalgia": s1.checkbox("Erytromelalgia"),
-            "zawroty": s1.checkbox("Zawroty głowy"),
-            "mikrokrążenie": s2.checkbox("Objawy mikrokrążeniowe"),
-            "nocne_poty": s2.checkbox("Nocne poty"),
-            "spadek_masy": s2.checkbox("Spadek masy ciała"),
-        }
+    c1, c2 = st.columns(2)
+    c1.number_input("Wiek", min_value=0, max_value=120, key="age")
+    c2.selectbox("Płeć", ["M", "K", "inna / niepodano"], key="sex")
 
-        st.subheader("4 kolejne badania")
+    d1, d2, d3 = st.columns(3)
+    d1.number_input("Masa ciała (kg)", min_value=20.0, max_value=300.0, key="weight")
+    d2.number_input("Wzrost (cm)", min_value=100.0, max_value=250.0, key="height")
+    d3.selectbox("Zakrzepica w wywiadzie", ["nie", "tak"], key="thrombosis_history")
+
+    bmi = bmi_calc(st.session_state["weight"], st.session_state["height"])
+    st.info(f"BMI: {bmi:.1f} ({bmi_class(bmi)})" if bmi is not None else "BMI: brak danych")
+
+    st.subheader("Aktualne leczenie")
+    st.text_area(
+        "Leczenie",
+        key="treatment_text",
+        height=120,
+        placeholder="Np. ASA, Acard, apiksaban, hydroksymocznik, ropeg, Jakavi, allopurinol",
+        label_visibility="collapsed",
+    )
+
+    st.subheader("Objawy")
+    s1, s2 = st.columns(2)
+    s1.checkbox("Świąd", key="symptom_itch")
+    s1.checkbox("Ból głowy", key="symptom_headache")
+    s1.checkbox("Erytromelalgia", key="symptom_erythromelalgia")
+    s2.checkbox("Zawroty głowy", key="symptom_dizziness")
+    s2.checkbox("Objawy mikrokrążeniowe", key="symptom_micro")
+    s2.checkbox("Nocne poty", key="symptom_nightsweats")
+    s2.checkbox("Spadek masy ciała", key="symptom_weightloss")
+
+    with st.expander("4 kolejne badania", expanded=True):
         cbc_rows = []
         for i in range(4):
             st.markdown(f"**Badanie {i+1}**")
-            c1, c2, c3, c4 = st.columns(4)
-            d1, d2, d3, d4 = st.columns(4)
+            r1 = st.columns(4)
+            r2 = st.columns(4)
+            r3 = st.columns(3)
 
-            row_date = c1.date_input(f"Data {i+1}", value=date.today(), key=f"cbc_date_{i}")
-            row_hct = c2.number_input(f"Hct {i+1}", min_value=20.0, max_value=80.0, value=45.0, step=0.1, key=f"cbc_hct_{i}")
-            row_hb = c3.number_input(f"Hb {i+1}", min_value=5.0, max_value=25.0, value=15.0, step=0.1, key=f"cbc_hb_{i}")
-            row_wbc = c4.number_input(f"WBC {i+1}", min_value=0.0, max_value=200.0, value=10.0, step=0.1, key=f"cbc_wbc_{i}")
+            r1[0].date_input("Data", key=f"cbc_date_{i}")
+            r1[1].number_input("Hct", min_value=20.0, max_value=80.0, key=f"cbc_hct_{i}")
+            r1[2].number_input("Hb", min_value=5.0, max_value=25.0, key=f"cbc_hb_{i}")
+            r1[3].number_input("WBC", min_value=0.0, max_value=200.0, key=f"cbc_wbc_{i}")
 
-            row_plt = d1.number_input(f"PLT {i+1}", min_value=0.0, max_value=3000.0, value=400.0, step=1.0, key=f"cbc_plt_{i}")
-            row_ldh = d2.number_input(f"LDH {i+1}", min_value=0.0, max_value=3000.0, value=250.0, step=1.0, key=f"cbc_ldh_{i}")
-            row_uric = d3.number_input(f"Kwas moczowy {i+1}", min_value=0.0, max_value=20.0, value=6.0, step=0.1, key=f"cbc_uric_{i}")
-            row_ferritin = d4.number_input(f"Ferrytyna {i+1}", min_value=0.0, max_value=2000.0, value=50.0, step=1.0, key=f"cbc_ferr_{i}")
+            r2[0].number_input("PLT", min_value=0.0, max_value=3000.0, key=f"cbc_plt_{i}")
+            r2[1].number_input("LDH", min_value=0.0, max_value=3000.0, key=f"cbc_ldh_{i}")
+            r2[2].number_input("Kwas moczowy", min_value=0.0, max_value=20.0, key=f"cbc_uric_{i}")
+            r2[3].number_input("Ferrytyna", min_value=0.0, max_value=2000.0, key=f"cbc_ferr_{i}")
 
-            e1, e2, e3 = st.columns(3)
-            row_creat = e1.number_input(f"Kreatynina {i+1}", min_value=0.0, max_value=10.0, value=1.0, step=0.1, key=f"cbc_creat_{i}")
-            row_rdw = e2.number_input(f"RDW {i+1}", min_value=0.0, max_value=40.0, value=13.0, step=0.1, key=f"cbc_rdw_{i}")
-            row_b2m = e3.number_input(f"Beta-2-mikroglobulina {i+1}", min_value=0.0, max_value=20.0, value=2.0, step=0.1, key=f"cbc_b2m_{i}")
+            r3[0].number_input("Kreatynina", min_value=0.0, max_value=10.0, key=f"cbc_creat_{i}")
+            r3[1].number_input("RDW", min_value=0.0, max_value=40.0, key=f"cbc_rdw_{i}")
+            r3[2].number_input("Beta-2-mikroglobulina", min_value=0.0, max_value=20.0, key=f"cbc_b2m_{i}")
 
-            cbc_rows.append(
-                {
-                    "date": row_date,
-                    "hct": safe_float(row_hct),
-                    "hb": safe_float(row_hb),
-                    "wbc": safe_float(row_wbc),
-                    "plt": safe_float(row_plt),
-                    "ldh": safe_float(row_ldh),
-                    "uric_acid": safe_float(row_uric),
-                    "ferritin": safe_float(row_ferritin),
-                    "creatinine": safe_float(row_creat),
-                    "rdw": safe_float(row_rdw),
-                    "beta2m": safe_float(row_b2m),
-                }
-            )
+            cbc_rows.append({
+                "date": st.session_state[f"cbc_date_{i}"],
+                "hct": safe_float(st.session_state[f"cbc_hct_{i}"]),
+                "hb": safe_float(st.session_state[f"cbc_hb_{i}"]),
+                "wbc": safe_float(st.session_state[f"cbc_wbc_{i}"]),
+                "plt": safe_float(st.session_state[f"cbc_plt_{i}"]),
+                "ldh": safe_float(st.session_state[f"cbc_ldh_{i}"]),
+                "uric_acid": safe_float(st.session_state[f"cbc_uric_{i}"]),
+                "ferritin": safe_float(st.session_state[f"cbc_ferr_{i}"]),
+                "creatinine": safe_float(st.session_state[f"cbc_creat_{i}"]),
+                "rdw": safe_float(st.session_state[f"cbc_rdw_{i}"]),
+                "beta2m": safe_float(st.session_state[f"cbc_b2m_{i}"]),
+            })
 
-        st.subheader("4 ostatnie upusty")
+    with st.expander("4 ostatnie upusty", expanded=True):
         phleb_rows = []
         for i in range(4):
             p1, p2 = st.columns(2)
-            ph_date = p1.date_input(f"Data upustu {i+1}", value=date.today(), key=f"ph_date_{i}")
-            ph_ml = p2.number_input(f"Objętość ml {i+1}", min_value=0, max_value=1000, value=300, step=25, key=f"ph_ml_{i}")
-            phleb_rows.append({"date": ph_date, "ml": ph_ml})
+            p1.date_input("Data upustu", key=f"ph_date_{i}")
+            p2.number_input("Objętość ml", min_value=0, max_value=1000, step=25, key=f"ph_ml_{i}")
+            phleb_rows.append({
+                "date": st.session_state[f"ph_date_{i}"],
+                "ml": st.session_state[f"ph_ml_{i}"],
+            })
 
-    with right:
-        st.subheader("Analiza")
+with right:
+    st.subheader("Analiza wizyty")
 
-        if st.button("Oceń pacjenta", type="primary"):
-            cbc_rows = sorted(cbc_rows, key=lambda x: x["date"])
-            phleb_rows = sorted(phleb_rows, key=lambda x: x["date"])
+    analyze_clicked = st.button("Analizuj wizytę", type="primary", use_container_width=True)
 
-            data = {
-                "patient_id": patient_id,
-                "age": int(age),
-                "sex": sex,
-                "weight": float(weight),
-                "height": float(height),
-                "thrombosis_history": thrombosis_history,
-                "treatment": treatment,
-                "cbc_rows": cbc_rows,
-                "phleb_rows": phleb_rows,
-                "symptoms": symptoms,
-            }
+    if analyze_clicked:
+        data = {
+            "patient_id": st.session_state["patient_id"],
+            "age": int(st.session_state["age"]),
+            "sex": st.session_state["sex"],
+            "weight": float(st.session_state["weight"]),
+            "height": float(st.session_state["height"]),
+            "thrombosis_history": st.session_state["thrombosis_history"],
+            "treatment": st.session_state["treatment_text"],
+            "cbc_rows": sorted(cbc_rows, key=lambda x: x["date"]),
+            "phleb_rows": sorted(phleb_rows, key=lambda x: x["date"]),
+            "symptoms": {
+                "świąd": st.session_state["symptom_itch"],
+                "ból_głowy": st.session_state["symptom_headache"],
+                "erytromelalgia": st.session_state["symptom_erythromelalgia"],
+                "zawroty": st.session_state["symptom_dizziness"],
+                "mikrokrążenie": st.session_state["symptom_micro"],
+                "nocne_poty": st.session_state["symptom_nightsweats"],
+                "spadek_masy": st.session_state["symptom_weightloss"],
+            },
+        }
 
-            summary, quick, current_hct, next_ml, flags, drug_alerts = build_summary(data)
+        result = build_analysis(data)
+        st.session_state["analysis_ready"] = True
+        st.session_state["last_summary"] = result["summary"]
+        st.session_state["last_quick"] = result["quick"]
+        st.session_state["last_flags"] = result["flags"]
+        st.session_state["last_drug_alerts"] = result["drug_alerts"]
+        st.session_state["last_next_ml"] = result["next_ml"]
+        st.session_state["last_hct"] = result["current_hct"]
+        st.session_state["last_note"] = result["note"]
+        st.session_state["last_data"] = data
 
-            if current_hct is not None and current_hct > TARGET_HCT:
-                st.error(quick)
-            else:
-                st.success(quick)
+    if st.session_state.get("analysis_ready", False):
+        m1, m2, m3, m4 = st.columns(4)
+        current_hct = st.session_state["last_hct"]
+        next_ml = st.session_state["last_next_ml"]
+        flags = st.session_state["last_flags"]
 
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Hct", f"{current_hct:.1f}%" if current_hct is not None else "brak")
-            m2.metric("Kolejny upust do rozważenia", f"{next_ml} ml")
-            m3.metric("Liczba flag", f"{len(flags)}")
+        m1.metric("Hct", f"{current_hct:.1f}%" if current_hct is not None else "brak")
+        m2.metric("Upust do rozważenia", f"{next_ml} ml")
+        m3.metric("Czerwone flagi", str(len(flags)))
+        m4.metric("Status", "poza celem" if current_hct and current_hct > TARGET_HCT else "w celu")
 
-            if flags:
-                st.subheader("Czerwone flagi")
-                for f in flags:
-                    st.error(f)
+        if flags:
+            st.markdown("### Czerwone flagi")
+            for f in flags:
+                st.error(f)
 
-            if drug_alerts:
-                st.subheader("Ostrzeżenia lekowe")
-                for a in drug_alerts:
-                    st.warning(a)
+        if st.session_state["last_drug_alerts"]:
+            st.markdown("### Ostrzeżenia lekowe")
+            for a in st.session_state["last_drug_alerts"]:
+                st.warning(a)
 
-            st.text_area("Podsumowanie lekarskie", value=summary, height=560)
+        st.markdown("### Podsumowanie lekarskie")
+        st.text_area(
+            "summary_box",
+            value=st.session_state["last_summary"],
+            height=420,
+            label_visibility="collapsed",
+        )
 
-            df = pd.DataFrame(cbc_rows)
-            if not df.empty:
-                df_chart = df.copy()
-                df_chart["date"] = pd.to_datetime(df_chart["date"])
-                df_chart = df_chart.set_index("date")
+        st.markdown("### Notatka do dokumentacji")
+        st.text_area(
+            "edm_note_box",
+            value=st.session_state["last_note"],
+            height=180,
+            label_visibility="collapsed",
+        )
 
-                st.subheader("Trend Hct")
-                st.line_chart(df_chart[["hct"]])
+        csave1, csave2, csave3 = st.columns(3)
 
-                st.subheader("Trend Hb / WBC / PLT")
-                st.line_chart(df_chart[["hb", "wbc", "plt"]])
+        with csave1:
+            if st.button("Zapisz wizytę do historii", use_container_width=True):
+                if st.session_state["last_data"]["patient_id"]:
+                    record = visit_to_record(
+                        st.session_state["last_data"],
+                        st.session_state["last_summary"],
+                        st.session_state["last_next_ml"],
+                    )
+                    append_visit_to_csv(record)
+                    st.success("Wizyta zapisana.")
+                else:
+                    st.error("Najpierw wpisz ID pacjenta.")
 
-                csv_data = df.reset_index().to_csv(index=False).encode("utf-8-sig")
-                st.download_button(
-                    "Pobierz badania jako CSV",
-                    data=csv_data,
-                    file_name="pv_badania.csv",
-                    mime="text/csv",
-                )
-
+        with csave2:
+            pdf_bytes = make_pdf_bytes("PV Assistant - podsumowanie", st.session_state["last_summary"])
             st.download_button(
-                "Pobierz podsumowanie jako TXT",
-                data=summary.encode("utf-8"),
-                file_name="pv_podsumowanie.txt",
-                mime="text/plain",
+                "Pobierz PDF",
+                data=pdf_bytes,
+                file_name="pv_podsumowanie.pdf",
+                mime="application/pdf",
+                use_container_width=True,
             )
 
-            if patient_id:
-                record = visit_to_record(data, summary, next_ml)
-                append_visit_to_csv(record)
-                st.success("Wizyta zapisana do historii pacjenta.")
-        else:
-            st.info("Wprowadź dane i kliknij „Oceń pacjenta”.")
+        with csave3:
+            st.download_button(
+                "Pobierz TXT",
+                data=st.session_state["last_summary"].encode("utf-8"),
+                file_name="pv_podsumowanie.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
 
-with tab_history:
+if st.session_state["patient_id"]:
+    st.markdown("---")
     st.subheader("Historia pacjenta")
-    history_pid = st.text_input("ID pacjenta do wczytania historii", value="", key="history_pid")
 
-    if st.button("Wczytaj historię"):
-        hist = load_patient_history(history_pid)
-        if hist.empty:
-            st.warning("Brak zapisanej historii dla tego ID.")
-        else:
-            st.dataframe(hist, use_container_width=True)
-
-            cols_to_plot = [c for c in ["hct", "hb", "wbc", "plt", "ldh", "uric_acid", "ferritin"] if c in hist.columns]
-            if "visit_date" in hist.columns and cols_to_plot:
-                plot_df = hist.copy()
-                plot_df["visit_date"] = pd.to_datetime(plot_df["visit_date"])
-                plot_df = plot_df.set_index("visit_date")
-                st.subheader("Trend zapisanych wizyt")
-                st.line_chart(plot_df[cols_to_plot])
-
-            if len(hist) >= 2:
-                last = hist.iloc[-1]
-                prev = hist.iloc[-2]
-
-                st.subheader("Porównanie z poprzednią wizytą")
-                compare_lines = []
-
-                for col, label in [
-                    ("hct", "Hct"),
-                    ("hb", "Hb"),
-                    ("wbc", "WBC"),
-                    ("plt", "PLT"),
-                    ("ldh", "LDH"),
-                    ("uric_acid", "Kwas moczowy"),
-                    ("ferritin", "Ferrytyna"),
-                ]:
-                    if col in hist.columns:
-                        try:
-                            diff = float(last[col]) - float(prev[col])
-                            compare_lines.append(f"{label}: zmiana {diff:+.2f}")
-                        except Exception:
-                            pass
-
-                st.text("\n".join(compare_lines) if compare_lines else "Brak danych do porównania.")
-
-with tab_treatment:
-    st.subheader("Leczenie i ostrzeżenia")
-    treatment_text = st.text_area(
-        "Wpisz aktualne leczenie",
-        value="",
-        height=160,
-        placeholder="Np. ASA, apiksaban, hydroksymocznik, ruxolitinib, allopurinol",
-    )
-
-    current_plt_for_drugs = st.number_input("Aktualne PLT", min_value=0.0, max_value=3000.0, value=400.0, step=1.0)
-    drug_flags = parse_treatment_flags(treatment_text)
-    alerts = build_drug_alerts(drug_flags, current_plt_for_drugs)
-
-    st.write("Rozpoznane grupy leków:")
-    found = []
-    if drug_flags["asa"]:
-        found.append("ASA")
-    if drug_flags["anticoagulant"]:
-        found.append("antykoagulant")
-    if drug_flags["hydroxyurea"]:
-        found.append("hydroksymocznik")
-    if drug_flags["interferon"]:
-        found.append("interferon")
-    if drug_flags["ruxolitinib"]:
-        found.append("ruxolitinib")
-    if drug_flags["allopurinol"]:
-        found.append("allopurinol")
-    if drug_flags["statin"]:
-        found.append("statyna")
-
-    st.info(", ".join(found) if found else "Brak rozpoznanych grup leków.")
-
-    st.write("Ostrzeżenia:")
-    if alerts:
-        for a in alerts:
-            st.warning(a)
+    if history_df.empty:
+        st.info("Brak zapisanej historii dla tego ID.")
     else:
-        st.success("Brak istotnych ostrzeżeń wykrytych w tym prostym silniku.")
+        hist_left, hist_right = st.columns([1, 1])
+
+        with hist_left:
+            st.dataframe(history_df.tail(10), use_container_width=True)
+
+        with hist_right:
+            compare_lines = compare_with_previous(history_df)
+            st.markdown("### Porównanie z poprzednią wizytą")
+            if compare_lines:
+                for line in compare_lines:
+                    st.write(line)
+            else:
+                st.write("Za mało wizyt do porównania.")
+
+        if "visit_date" in history_df.columns:
+            plot_df = history_df.copy()
+            plot_df["visit_date"] = pd.to_datetime(plot_df["visit_date"])
+            plot_df = plot_df.set_index("visit_date")
+
+            st.markdown("### Trendy z zapisanych wizyt")
+            cols_to_plot = [c for c in ["hct", "hb", "wbc", "plt", "ldh", "uric_acid", "ferritin"] if c in plot_df.columns]
+            if cols_to_plot:
+                st.line_chart(plot_df[cols_to_plot])
