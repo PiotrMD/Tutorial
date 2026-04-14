@@ -1,21 +1,20 @@
 import io
 import os
-from datetime import date, timedelta
-from typing import List
+import re
+from datetime import date, datetime, timedelta
+from typing import List, Dict, Any, Optional
 
 import pandas as pd
 import streamlit as st
+import fitz
+from PIL import Image
 from reportlab.lib.pagesizes import A4
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
-APP_TITLE = "Asystent kliniczny – czerwienica prawdziwa"
+APP_TITLE = "Asystent kliniczny - czerwienica prawdziwa"
 DATA_FILE = "patients.csv"
 TARGET_HCT = 45.0
 MAX_SINGLE_PHLEB_ML = 300
-PDF_FONT_FILE = "DejaVuSans.ttf"
-PDF_FONT_NAME = "DejaVuSans"
 
 st.set_page_config(
     page_title=APP_TITLE,
@@ -28,50 +27,41 @@ try:
 except Exception:
     pass
 
-
-# =========================
-# STYLE
-# =========================
-
 st.markdown(
     """
     <style>
     .main .block-container {
-        max-width: 1000px;
-        padding-top: 2rem;
-        padding-bottom: 3rem;
+        max-width: 1050px;
+        padding-top: 1.6rem;
+        padding-bottom: 2.4rem;
     }
     .ak-card {
         padding: 14px 16px;
         border-radius: 14px;
-        border: 1px solid rgba(120,120,120,0.25);
+        border: 1px solid rgba(120,120,120,0.22);
         background: rgba(250,250,250,0.03);
         margin-bottom: 12px;
     }
     .ak-kpi-title {
-        font-size: 0.9rem;
-        opacity: 0.8;
+        font-size: 0.92rem;
+        opacity: 0.78;
         margin-bottom: 4px;
     }
     .ak-kpi-value {
         font-size: 1.35rem;
         font-weight: 700;
+        line-height: 1.2;
     }
     .ak-section {
-        margin-top: 1.2rem;
-        margin-bottom: 0.6rem;
-        font-size: 1.2rem;
+        margin-top: 1.25rem;
+        margin-bottom: 0.55rem;
+        font-size: 1.16rem;
         font-weight: 700;
     }
     </style>
     """,
     unsafe_allow_html=True,
 )
-
-
-# =========================
-# DOMYŚLNE WARTOŚCI
-# =========================
 
 DEFAULTS = {
     "patient_id": "",
@@ -122,10 +112,6 @@ for i in range(12):
     DEFAULTS[f"ph_ml_{i}"] = 300
 
 
-# =========================
-# SESSION STATE
-# =========================
-
 def init_state():
     for key, value in DEFAULTS.items():
         if key not in st.session_state:
@@ -151,16 +137,13 @@ def clear_form():
         "last_phleb_ml_year",
         "last_phleb_avg_interval",
         "last_data",
+        "imported_labs_preview",
     ]:
         if key in st.session_state:
             del st.session_state[key]
 
     st.rerun()
 
-
-# =========================
-# HELPERS
-# =========================
 
 def safe_float(value):
     if value is None:
@@ -211,7 +194,6 @@ def round_to_25(value):
 def estimate_blood_volume_liters(sex: str, height_cm, weight_kg):
     if height_cm is None or weight_kg is None:
         return None
-
     h = height_cm / 100.0
     w = weight_kg
 
@@ -284,7 +266,7 @@ def persistent_above_target(values, n_needed=2):
     vals = [v for v in values if v is not None]
     if len(vals) < n_needed:
         return False
-    return all(v > TARGET_HCT for v in vals[-n_needed:])
+    return all(v > TARGET_HCT for v in vals[-n_needed:]
 
 
 def parse_treatment_flags(text: str):
@@ -424,53 +406,158 @@ def assess_cytoreduction_need(age, hx_thrombosis, treatment_flags, cbc_rows, avg
     return conclusion, reasons
 
 
-# =========================
-# HISTORIA I PLIKI
-# =========================
+LOCAL_NORMS = {
+    "hct": "K: 37-47%, M: 40-54%",
+    "hb": "K: 12-16 g/dl, M: 14-18 g/dl",
+    "wbc": "4.0-10.0",
+    "plt": "150-400",
+    "ldh": "<250",
+    "uric_acid": "K: 2.4-5.7, M: 3.4-7.0",
+    "ferritin": "K: 13-150, M: 30-400",
+    "creatinine": "ok. 0.6-1.3",
+    "rdw": "11.5-14.5%",
+    "beta2m": "0.8-2.2",
+    "glucose": "70-99",
+    "alt": "<41",
+    "ast": "<40",
+    "ggtp": "K <40, M <60",
+    "bilirubin": "0.2-1.2",
+}
 
-def visit_to_record(data, summary, next_ml):
-    current = data["cbc_rows"][-1]
-    return {
-        "patient_id": data["patient_id"],
-        "visit_date": date.today().isoformat(),
-        "age": data["age"],
-        "sex": data["sex"],
-        "weight": data["weight"],
-        "height": data["height"],
-        "diagnoses_text": data["diagnoses_text"],
-        "history_text": data["history_text"],
-        "treatment_text": data["treatment_text"],
-        "hx_thrombosis": data["hx_thrombosis"],
-        "hx_bleeding": data["hx_bleeding"],
-        "hx_spleen": data["hx_spleen"],
-        "hx_smoking": data["hx_smoking"],
-        "symptom_itch": data["symptoms"]["świąd"],
-        "symptom_headache": data["symptoms"]["ból_głowy"],
-        "symptom_erythromelalgia": data["symptoms"]["erytromelalgia"],
-        "symptom_dizziness": data["symptoms"]["zawroty"],
-        "symptom_micro": data["symptoms"]["mikrokrążenie"],
-        "symptom_nightsweats": data["symptoms"]["nocne_poty"],
-        "symptom_weightloss": data["symptoms"]["spadek_masy"],
-        "other_symptoms_text": data["other_symptoms_text"],
-        "other_events_text": data["other_events_text"],
-        "hct": current["hct"],
-        "hb": current["hb"],
-        "wbc": current["wbc"],
-        "plt": current["plt"],
-        "ldh": current["ldh"],
-        "uric_acid": current["uric_acid"],
-        "ferritin": current["ferritin"],
-        "creatinine": current["creatinine"],
-        "rdw": current["rdw"],
-        "beta2m": current["beta2m"],
-        "glucose": current["glucose"],
-        "alt": current["alt"],
-        "ast": current["ast"],
-        "ggtp": current["ggtp"],
-        "bilirubin": current["bilirubin"],
-        "next_ml": next_ml,
-        "summary": summary,
+ANALYTE_PATTERNS = {
+    "hct": r"(?:hct|hematokryt)[^\d]{0,20}(\d+[.,]?\d*)",
+    "hb": r"(?:hb|hgb|hemoglobina)[^\d]{0,20}(\d+[.,]?\d*)",
+    "wbc": r"(?:wbc|leukocyty)[^\d]{0,20}(\d+[.,]?\d*)",
+    "plt": r"(?:plt|płytki|plytki|trombocyty)[^\d]{0,20}(\d+[.,]?\d*)",
+    "ldh": r"(?:ldh)[^\d]{0,20}(\d+[.,]?\d*)",
+    "uric_acid": r"(?:kwas moczowy|uric acid)[^\d]{0,20}(\d+[.,]?\d*)",
+    "ferritin": r"(?:ferrytyna|ferritin)[^\d]{0,20}(\d+[.,]?\d*)",
+    "creatinine": r"(?:kreatynina|creatinine)[^\d]{0,20}(\d+[.,]?\d*)",
+    "rdw": r"(?:rdw)[^\d]{0,20}(\d+[.,]?\d*)",
+    "beta2m": r"(?:beta[\s-]*2[\s-]*mikroglobulina|beta[\s-]*2[\s-]*microglobulin|b2m)[^\d]{0,20}(\d+[.,]?\d*)",
+    "glucose": r"(?:glukoza|glucose)[^\d]{0,20}(\d+[.,]?\d*)",
+    "alt": r"(?:alat|alt)[^\d]{0,20}(\d+[.,]?\d*)",
+    "ast": r"(?:aspat|ast)[^\d]{0,20}(\d+[.,]?\d*)",
+    "ggtp": r"(?:ggtp|ggt)[^\d]{0,20}(\d+[.,]?\d*)",
+    "bilirubin": r"(?:bilirubina|bilirubin)[^\d]{0,20}(\d+[.,]?\d*)",
+}
+
+
+def parse_date_from_text(text: str) -> Optional[date]:
+    patterns = [
+        r"(\d{4}[-/.]\d{2}[-/.]\d{2})",
+        r"(\d{2}[-/.]\d{2}[-/.]\d{4})",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text)
+        if m:
+            raw = m.group(1).replace("/", "-").replace(".", "-")
+            for fmt in ("%Y-%m-%d", "%d-%m-%Y"):
+                try:
+                    return datetime.strptime(raw, fmt).date()
+                except Exception:
+                    pass
+    return None
+
+
+def extract_text_from_pdf(file_bytes: bytes) -> str:
+    text = []
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    for page in doc:
+        text.append(page.get_text("text"))
+    return "\n".join(text)
+
+
+def extract_text_from_image(uploaded_file) -> str:
+    try:
+        import pytesseract
+        img = Image.open(uploaded_file)
+        return pytesseract.image_to_string(img, lang="eng")
+    except Exception:
+        return ""
+
+
+def parse_labs_from_text(text: str) -> Dict[str, Any]:
+    result = {
+        "date": parse_date_from_text(text) or date.today(),
+        "hct": None,
+        "hb": None,
+        "wbc": None,
+        "plt": None,
+        "ldh": None,
+        "uric_acid": None,
+        "ferritin": None,
+        "creatinine": None,
+        "rdw": None,
+        "beta2m": None,
+        "glucose": None,
+        "alt": None,
+        "ast": None,
+        "ggtp": None,
+        "bilirubin": None,
     }
+    lowered = text.lower()
+
+    for key, pattern in ANALYTE_PATTERNS.items():
+        m = re.search(pattern, lowered, re.IGNORECASE)
+        if m:
+            result[key] = safe_float(m.group(1))
+
+    return result
+
+
+def import_uploaded_files(files) -> List[Dict[str, Any]]:
+    imported = []
+    for f in files:
+        text = ""
+        filetype = f.type or ""
+
+        if filetype == "application/pdf":
+            try:
+                text = extract_text_from_pdf(f.read())
+            except Exception:
+                text = ""
+        elif filetype in ["image/jpeg", "image/png"]:
+            try:
+                text = extract_text_from_image(f)
+            except Exception:
+                text = ""
+
+        if text.strip():
+            imported.append(parse_labs_from_text(text))
+
+    imported = [x for x in imported if any(v is not None for k, v in x.items() if k != "date")]
+    imported.sort(key=lambda x: x["date"])
+    return imported
+
+
+def apply_imported_labs(imported_labs: List[Dict[str, Any]]):
+    if not imported_labs:
+        return
+    n = min(len(imported_labs), 10)
+    st.session_state["labs_n"] = max(st.session_state["labs_n"], n)
+
+    for i, lab in enumerate(imported_labs[:10]):
+        st.session_state[f"cbc_date_{i}"] = lab.get("date", date.today())
+        for key, state_key in [
+            ("hct", f"cbc_hct_{i}"),
+            ("hb", f"cbc_hb_{i}"),
+            ("wbc", f"cbc_wbc_{i}"),
+            ("plt", f"cbc_plt_{i}"),
+            ("ldh", f"cbc_ldh_{i}"),
+            ("uric_acid", f"cbc_uric_{i}"),
+            ("ferritin", f"cbc_ferr_{i}"),
+            ("creatinine", f"cbc_creat_{i}"),
+            ("rdw", f"cbc_rdw_{i}"),
+            ("beta2m", f"cbc_b2m_{i}"),
+            ("glucose", f"cbc_glu_{i}"),
+            ("alt", f"cbc_alt_{i}"),
+            ("ast", f"cbc_ast_{i}"),
+            ("ggtp", f"cbc_ggtp_{i}"),
+            ("bilirubin", f"cbc_bili_{i}"),
+        ]:
+            if lab.get(key) is not None:
+                st.session_state[state_key] = float(lab[key])
 
 
 def append_visit_to_csv(record):
@@ -524,30 +611,26 @@ def compare_with_previous_visit(history_df):
     return lines
 
 
-# =========================
-# PDF
-# =========================
-
 def prepare_pdf_font():
-    if os.path.exists(PDF_FONT_FILE):
-        try:
-            pdfmetrics.registerFont(TTFont(PDF_FONT_NAME, PDF_FONT_FILE))
-            return PDF_FONT_NAME
-        except Exception:
-            return "Helvetica"
-    return "Helvetica"
+    try:
+        import reportlab
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        vera_path = os.path.join(os.path.dirname(reportlab.__file__), "fonts", "Vera.ttf")
+        pdfmetrics.registerFont(TTFont("Vera", vera_path))
+        return "Vera"
+    except Exception:
+        return "Helvetica"
 
 
 def wrap_text(text, width, font_name="Helvetica", font_size=10):
     from reportlab.pdfbase.pdfmetrics import stringWidth
-
     lines = []
     for paragraph in text.split("\n"):
         words = paragraph.split()
         if not words:
             lines.append("")
             continue
-
         current = words[0]
         for word in words[1:]:
             test = current + " " + word
@@ -590,10 +673,6 @@ def make_pdf_bytes(title, body):
     return buffer.getvalue()
 
 
-# =========================
-# ANALIZA
-# =========================
-
 def build_compare_four_entered(cbc_rows):
     rows = []
     last_four = sorted(cbc_rows, key=lambda x: x["date"])[-4:]
@@ -618,6 +697,7 @@ def build_compare_four_entered(cbc_rows):
         row = {"Parametr": label}
         for i, item in enumerate(last_four, start=1):
             row[f"{i} ({item['date'].isoformat()})"] = item.get(key)
+            row[f"Norma {i}"] = LOCAL_NORMS.get(key, "")
         rows.append(row)
 
     return pd.DataFrame(rows)
@@ -651,6 +731,51 @@ def build_phleb_year_stats(phleb_rows):
         prev_date = row["date"]
 
     return count_year, total_ml_year, avg_interval, pd.DataFrame(table_rows)
+
+
+def visit_to_record(data, summary, next_ml):
+    current = data["cbc_rows"][-1]
+    return {
+        "patient_id": data["patient_id"],
+        "visit_date": date.today().isoformat(),
+        "age": data["age"],
+        "sex": data["sex"],
+        "weight": data["weight"],
+        "height": data["height"],
+        "diagnoses_text": data["diagnoses_text"],
+        "history_text": data["history_text"],
+        "treatment_text": data["treatment_text"],
+        "hx_thrombosis": data["hx_thrombosis"],
+        "hx_bleeding": data["hx_bleeding"],
+        "hx_spleen": data["hx_spleen"],
+        "hx_smoking": data["hx_smoking"],
+        "symptom_itch": data["symptoms"]["świąd"],
+        "symptom_headache": data["symptoms"]["ból_głowy"],
+        "symptom_erythromelalgia": data["symptoms"]["erytromelalgia"],
+        "symptom_dizziness": data["symptoms"]["zawroty"],
+        "symptom_micro": data["symptoms"]["mikrokrążenie"],
+        "symptom_nightsweats": data["symptoms"]["nocne_poty"],
+        "symptom_weightloss": data["symptoms"]["spadek_masy"],
+        "other_symptoms_text": data["other_symptoms_text"],
+        "other_events_text": data["other_events_text"],
+        "hct": current["hct"],
+        "hb": current["hb"],
+        "wbc": current["wbc"],
+        "plt": current["plt"],
+        "ldh": current["ldh"],
+        "uric_acid": current["uric_acid"],
+        "ferritin": current["ferritin"],
+        "creatinine": current["creatinine"],
+        "rdw": current["rdw"],
+        "beta2m": current["beta2m"],
+        "glucose": current["glucose"],
+        "alt": current["alt"],
+        "ast": current["ast"],
+        "ggtp": current["ggtp"],
+        "bilirubin": current["bilirubin"],
+        "next_ml": next_ml,
+        "summary": summary,
+    }
 
 
 def build_analysis(data):
@@ -791,15 +916,12 @@ def build_analysis(data):
         f"BMI: {bmi:.1f} ({bmi_class(bmi)})" if bmi is not None else "BMI: brak danych"
     )
     summary_lines.append("")
-
     summary_lines.append("Rozpoznania")
     if diagnosis_lines:
-        for line in diagnosis_lines:
-            summary_lines.append(line)
+        summary_lines.extend(diagnosis_lines)
     else:
         summary_lines.append("brak danych")
     summary_lines.append("")
-
     summary_lines.append("Historia choroby")
     if history_lines:
         for line in history_lines:
@@ -807,15 +929,12 @@ def build_analysis(data):
     else:
         summary_lines.append("brak danych")
     summary_lines.append("")
-
     summary_lines.append("Aktualne leczenie")
     if treatment_lines:
-        for line in treatment_lines:
-            summary_lines.append(line)
+        summary_lines.extend(treatment_lines)
     else:
         summary_lines.append("brak danych")
     summary_lines.append("")
-
     summary_lines.append("Wywiad / zdarzenia")
     summary_lines.append(
         f"Zakrzepica: {'tak' if data['hx_thrombosis'] else 'nie'} | "
@@ -826,18 +945,18 @@ def build_analysis(data):
     if data["other_events_text"].strip():
         summary_lines.append(f"Inne zdarzenia: {data['other_events_text'].strip()}")
     summary_lines.append("")
-
     summary_lines.append("Objawy")
     symptom_names = [k.replace("_", " ") for k, v in data["symptoms"].items() if v]
     summary_lines.append(", ".join(symptom_names) if symptom_names else "brak zaznaczonych objawów")
     if data["other_symptoms_text"].strip():
         summary_lines.append(f"Inne objawy: {data['other_symptoms_text'].strip()}")
     summary_lines.append("")
-
     summary_lines.append("Ocena aktualna")
     summary_lines.append(
         f"Hct {current_hct}, Hb {current_hb}, WBC {current_wbc}, PLT {current_plt}, "
-        f"LDH {current_ldh}, kwas moczowy {current_uric}, ferrytyna {current_ferritin}"
+        f"LDH {current_ldh}, kwas moczowy {current_uric}, ferrytyna {current_ferritin}, "
+        f"glukoza {current['glucose']}, ALT {current['alt']}, AST {current['ast']}, "
+        f"GGTP {current['ggtp']}, bilirubina {current['bilirubin']}"
     )
     summary_lines.append("")
     summary_lines.append("Komentarz")
@@ -857,7 +976,6 @@ def build_analysis(data):
         elif current_hct >= TARGET_HCT:
             summary_lines.append("Hct aktualnie pozostaje co najmniej na poziomie 45%.")
     summary_lines.append("")
-
     summary_lines.append("Upusty")
     summary_lines.append(phleb_frequency_text(avg_interval))
     summary_lines.append(f"Liczba upustów w bieżącym roku: {phleb_count_year}")
@@ -865,7 +983,6 @@ def build_analysis(data):
     if phleb_avg_interval is not None:
         summary_lines.append(f"Średni odstęp między upustami: {phleb_avg_interval:.1f} dni")
     summary_lines.append("")
-
     summary_lines.append("Czerwone flagi")
     if flags:
         for item in flags:
@@ -873,7 +990,6 @@ def build_analysis(data):
     else:
         summary_lines.append("brak istotnych flag")
     summary_lines.append("")
-
     summary_lines.append("Ostrzeżenia lekowe")
     if drug_alerts:
         for item in drug_alerts:
@@ -881,7 +997,6 @@ def build_analysis(data):
     else:
         summary_lines.append("brak istotnych ostrzeżeń wykrytych lokalnie")
     summary_lines.append("")
-
     summary_lines.append("Wnioski i zalecenia robocze")
     if recommendations:
         for item in recommendations:
@@ -965,10 +1080,6 @@ def build_analysis(data):
     }
 
 
-# =========================
-# START
-# =========================
-
 init_state()
 
 st.title(APP_TITLE)
@@ -982,6 +1093,46 @@ if not history_df.empty:
     st.success(f"Zapisane wizyty tego pacjenta: {len(history_df)}")
 else:
     st.info("Brak zapisanych wizyt dla tego ID")
+
+st.markdown('<div class="ak-section">Import wyników z pliku</div>', unsafe_allow_html=True)
+uploaded_files = st.file_uploader(
+    "Dodaj PDF, JPG lub PNG z wynikami badań",
+    type=["pdf", "jpg", "jpeg", "png"],
+    accept_multiple_files=True,
+)
+
+if uploaded_files:
+    imported = import_uploaded_files(uploaded_files)
+    st.session_state["imported_labs_preview"] = imported
+
+    if imported:
+        preview_rows = []
+        for idx, lab in enumerate(imported, start=1):
+            preview_rows.append({
+                "Badanie": idx,
+                "Data": lab["date"].isoformat() if lab.get("date") else "",
+                "Hct": lab.get("hct"),
+                "Hb": lab.get("hb"),
+                "WBC": lab.get("wbc"),
+                "PLT": lab.get("plt"),
+                "LDH": lab.get("ldh"),
+                "Kwas moczowy": lab.get("uric_acid"),
+                "Ferrytyna": lab.get("ferritin"),
+                "Kreatynina": lab.get("creatinine"),
+                "Glukoza": lab.get("glucose"),
+                "ALT": lab.get("alt"),
+                "AST": lab.get("ast"),
+                "GGTP": lab.get("ggtp"),
+                "Bilirubina": lab.get("bilirubin"),
+            })
+        st.dataframe(pd.DataFrame(preview_rows), use_container_width=True)
+
+        if st.button("Przepisz odczytane badania do formularza", use_container_width=True):
+            apply_imported_labs(imported)
+            st.success("Dane z plików zostały wpisane do formularza.")
+            st.rerun()
+    else:
+        st.warning("Nie udało się wiarygodnie odczytać wyników z przesłanych plików.")
 
 st.markdown('<div class="ak-section">Dane podstawowe</div>', unsafe_allow_html=True)
 st.number_input("Wiek", min_value=0, max_value=120, key="age")
@@ -1051,17 +1202,11 @@ st.text_area(
 )
 
 st.markdown('<div class="ak-section">Ostatnie badania</div>', unsafe_allow_html=True)
-r1, r2 = st.columns(2)
-with r1:
-    if st.button("➕ Dodaj badanie"):
-        if st.session_state["labs_n"] < 10:
-            st.session_state["labs_n"] += 1
-            st.rerun()
-with r2:
-    if st.button("➖ Usuń badanie"):
-        if st.session_state["labs_n"] > 1:
-            st.session_state["labs_n"] -= 1
-            st.rerun()
+c1, c2 = st.columns(2)
+with c1:
+    st.number_input("Liczba badań", min_value=1, max_value=10, key="labs_n")
+with c2:
+    st.caption("Daty wybierasz z kalendarza w każdym wierszu")
 
 cbc_rows = []
 for i in range(st.session_state["labs_n"]):
@@ -1106,15 +1251,9 @@ for i in range(st.session_state["labs_n"]):
 st.markdown('<div class="ak-section">Upusty</div>', unsafe_allow_html=True)
 u1, u2 = st.columns(2)
 with u1:
-    if st.button("➕ Dodaj upust"):
-        if st.session_state["phleb_n"] < 12:
-            st.session_state["phleb_n"] += 1
-            st.rerun()
+    st.number_input("Liczba upustów", min_value=1, max_value=12, key="phleb_n")
 with u2:
-    if st.button("➖ Usuń upust"):
-        if st.session_state["phleb_n"] > 1:
-            st.session_state["phleb_n"] -= 1
-            st.rerun()
+    st.caption("Daty wybierasz z kalendarza w każdym wierszu")
 
 phleb_rows = []
 for i in range(st.session_state["phleb_n"]):
@@ -1176,25 +1315,25 @@ if st.button("Analizuj wizytę", type="primary", use_container_width=True):
 if st.session_state.get("analysis_ready", False):
     st.markdown('<div class="ak-section">Analiza</div>', unsafe_allow_html=True)
 
-    c1, c2 = st.columns(2)
-    c3, c4 = st.columns(2)
+    col1, col2 = st.columns(2)
+    col3, col4 = st.columns(2)
 
-    with c1:
+    with col1:
         st.markdown(
             f'<div class="ak-card"><div class="ak-kpi-title">Hct aktualnie</div><div class="ak-kpi-value">{st.session_state["last_current_hct"]:.1f}%</div></div>',
             unsafe_allow_html=True,
         )
-    with c2:
+    with col2:
         st.markdown(
             f'<div class="ak-card"><div class="ak-kpi-title">Kolejny upust do rozważenia</div><div class="ak-kpi-value">{st.session_state["last_next_ml"]} ml</div></div>',
             unsafe_allow_html=True,
         )
-    with c3:
+    with col3:
         st.markdown(
             f'<div class="ak-card"><div class="ak-kpi-title">Status kontroli</div><div class="ak-kpi-value">{st.session_state["last_current_status"]}</div></div>',
             unsafe_allow_html=True,
         )
-    with c4:
+    with col4:
         st.markdown(
             f'<div class="ak-card"><div class="ak-kpi-title">Upusty w roku</div><div class="ak-kpi-value">{st.session_state["last_phleb_count_year"]}</div></div>',
             unsafe_allow_html=True,
