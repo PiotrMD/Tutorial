@@ -1,6 +1,7 @@
 import io
 import os
 from datetime import date, timedelta
+from typing import List, Dict, Any
 
 import pandas as pd
 import streamlit as st
@@ -16,7 +17,7 @@ MAX_SINGLE_PHLEB_ML = 300
 PDF_FONT_FILE = "DejaVuSans.ttf"
 PDF_FONT_NAME = "DejaVuSans"
 
-st.set_page_config(page_title=APP_TITLE, layout="wide")
+st.set_page_config(page_title=APP_TITLE, layout="centered")
 
 
 # =========================
@@ -32,6 +33,11 @@ DEFAULTS = {
     "diagnoses_text": "",
     "history_text": "",
     "treatment_text": "",
+    "hx_thrombosis": False,
+    "hx_bleeding": False,
+    "hx_spleen": False,
+    "hx_smoking": False,
+    "other_events_text": "",
     "symptom_itch": False,
     "symptom_headache": False,
     "symptom_erythromelalgia": False,
@@ -39,10 +45,6 @@ DEFAULTS = {
     "symptom_micro": False,
     "symptom_nightsweats": False,
     "symptom_weightloss": False,
-    "hx_thrombosis": False,
-    "hx_bleeding": False,
-    "hx_spleen": False,
-    "hx_smoking": False,
     "other_symptoms_text": "",
 }
 
@@ -75,12 +77,10 @@ def init_state():
 
 
 def clear_form():
-    patient_id = st.session_state.get("patient_id", "")
     for key, value in DEFAULTS.items():
         st.session_state[key] = value
-    st.session_state["patient_id"] = patient_id
 
-    for temp_key in [
+    for key in [
         "analysis_ready",
         "last_summary",
         "last_note",
@@ -90,11 +90,15 @@ def clear_form():
         "last_current_hct",
         "last_current_status",
         "last_compare_rows",
-        "last_previous_visit_compare",
+        "last_phleb_table",
+        "last_phleb_count_year",
+        "last_phleb_ml_year",
+        "last_phleb_avg_interval",
         "last_data",
     ]:
-        if temp_key in st.session_state:
-            del st.session_state[temp_key]
+        if key in st.session_state:
+            del st.session_state[key]
+
     st.rerun()
 
 
@@ -109,6 +113,12 @@ def safe_float(value):
         return float(str(value).replace(",", "."))
     except Exception:
         return None
+
+
+def text_lines(text: str) -> List[str]:
+    if not text:
+        return []
+    return [line.strip() for line in text.splitlines() if line.strip()]
 
 
 def bmi_calc(weight_kg, height_cm):
@@ -357,7 +367,7 @@ def assess_cytoreduction_need(age, hx_thrombosis, treatment_flags, cbc_rows, avg
 
 
 # =========================
-# HISTORY FILE
+# PLIKI I HISTORIA
 # =========================
 
 def visit_to_record(data, summary, next_ml):
@@ -384,6 +394,7 @@ def visit_to_record(data, summary, next_ml):
         "symptom_nightsweats": data["symptoms"]["nocne_poty"],
         "symptom_weightloss": data["symptoms"]["spadek_masy"],
         "other_symptoms_text": data["other_symptoms_text"],
+        "other_events_text": data["other_events_text"],
         "hct": current["hct"],
         "hb": current["hb"],
         "wbc": current["wbc"],
@@ -515,14 +526,9 @@ def make_pdf_bytes(title, body):
 # ANALIZA
 # =========================
 
-def build_compare_two_last_entered(cbc_rows):
-    if len(cbc_rows) < 2:
-        return pd.DataFrame()
-
-    prev = cbc_rows[-2]
-    curr = cbc_rows[-1]
-
+def build_compare_four_entered(cbc_rows):
     rows = []
+
     for key, label in [
         ("hct", "Hct"),
         ("hb", "Hb"),
@@ -535,35 +541,72 @@ def build_compare_two_last_entered(cbc_rows):
         ("rdw", "RDW"),
         ("beta2m", "Beta-2-mikroglobulina"),
     ]:
-        old_val = prev.get(key)
-        new_val = curr.get(key)
-        diff = None
-        trend = ""
-        if old_val is not None and new_val is not None:
-            diff = new_val - old_val
-            if diff > 0:
+        values = [row.get(key) for row in cbc_rows]
+        dates = [row.get("date") for row in cbc_rows]
+
+        diff_1_4 = None
+        trend = "za mało danych"
+
+        if len(values) >= 4 and values[0] is not None and values[3] is not None:
+            diff_1_4 = values[3] - values[0]
+
+        valid_vals = [v for v in values if v is not None]
+        if len(valid_vals) >= 2:
+            if valid_vals[-1] > valid_vals[0]:
                 trend = "wzrost"
-            elif diff < 0:
+            elif valid_vals[-1] < valid_vals[0]:
                 trend = "spadek"
             else:
                 trend = "bez zmian"
 
         rows.append({
             "Parametr": label,
-            "Poprzednie badanie": old_val,
-            "Ostatnie badanie": new_val,
-            "Różnica": diff,
-            "Trend": trend,
+            f"1 ({dates[0].isoformat()})": values[0] if len(values) > 0 else None,
+            f"2 ({dates[1].isoformat()})": values[1] if len(values) > 1 else None,
+            f"3 ({dates[2].isoformat()})": values[2] if len(values) > 2 else None,
+            f"4 ({dates[3].isoformat()})": values[3] if len(values) > 3 else None,
+            "Zmiana 1→4": diff_1_4,
+            "Trend ogólny": trend,
         })
 
     return pd.DataFrame(rows)
 
 
+def build_phleb_year_stats(phleb_rows):
+    if not phleb_rows:
+        return 0, 0, None, pd.DataFrame()
+
+    current_year = date.today().year
+    year_rows = [r for r in phleb_rows if r["date"] is not None and r["date"].year == current_year]
+
+    count_year = len(year_rows)
+    total_ml_year = sum(int(r["ml"]) for r in year_rows if r["ml"] is not None)
+
+    avg_interval = average_phleb_interval_days(phleb_rows)
+
+    table_rows = []
+    valid_sorted = sorted([r for r in phleb_rows if r["date"] is not None], key=lambda x: x["date"])
+
+    prev_date = None
+    for row in valid_sorted:
+        interval = None
+        if prev_date is not None:
+            interval = (row["date"] - prev_date).days
+        table_rows.append({
+            "Data upustu": row["date"].isoformat(),
+            "Objętość (ml)": row["ml"],
+            "Odstęp od poprzedniego (dni)": interval
+        })
+        prev_date = row["date"]
+
+    return count_year, total_ml_year, avg_interval, pd.DataFrame(table_rows)
+
+
 def build_analysis(data):
     bmi = bmi_calc(data["weight"], data["height"])
     treatment_flags = parse_treatment_flags(data["treatment_text"])
-    cbc_rows = data["cbc_rows"]
-    phleb_rows = data["phleb_rows"]
+    cbc_rows = sorted(data["cbc_rows"], key=lambda x: x["date"])
+    phleb_rows = sorted(data["phleb_rows"], key=lambda x: x["date"])
 
     current = cbc_rows[-1]
     current_hct = current["hct"]
@@ -613,6 +656,8 @@ def build_analysis(data):
         1 if data["symptoms"].get("nocne_poty") else 0,
         1 if data["symptoms"].get("spadek_masy") else 0,
     ])
+    if data["other_symptoms_text"].strip():
+        symptom_burden += 1
 
     cyto_conclusion, cyto_reasons = assess_cytoreduction_need(
         age=data["age"],
@@ -663,11 +708,18 @@ def build_analysis(data):
     if cyto_reasons:
         recommendations.append(cyto_conclusion)
 
+    phleb_count_year, phleb_ml_year, phleb_avg_interval, phleb_table = build_phleb_year_stats(phleb_rows)
+    compare_four = build_compare_four_entered(cbc_rows)
+
+    diagnosis_lines = text_lines(data["diagnoses_text"])
+    history_lines = text_lines(data["history_text"])
+    treatment_lines = text_lines(data["treatment_text"])
+
     summary_lines = []
     summary_lines.append("PODSUMOWANIE LEKARSKIE")
     summary_lines.append("=" * 72)
     summary_lines.append("")
-    summary_lines.append("Dane pacjenta")
+    summary_lines.append("Dane podstawowe")
     summary_lines.append(f"ID pacjenta: {data['patient_id'] or 'brak'}")
     summary_lines.append(f"Wiek: {data['age']}")
     summary_lines.append(f"Płeć: {data['sex']}")
@@ -676,35 +728,56 @@ def build_analysis(data):
         f"BMI: {bmi:.1f} ({bmi_class(bmi)})" if bmi is not None else "BMI: brak danych"
     )
     summary_lines.append("")
+
     summary_lines.append("Rozpoznania")
-    summary_lines.append(data["diagnoses_text"] if data["diagnoses_text"] else "brak danych")
+    if diagnosis_lines:
+        for line in diagnosis_lines:
+            summary_lines.append(f"• {line}")
+    else:
+        summary_lines.append("• brak danych")
     summary_lines.append("")
+
     summary_lines.append("Historia choroby")
-    summary_lines.append(data["history_text"] if data["history_text"] else "brak danych")
+    if history_lines:
+        for line in history_lines:
+            summary_lines.append(f"• {line}")
+    else:
+        summary_lines.append("• brak danych")
     summary_lines.append("")
+
     summary_lines.append("Aktualne leczenie")
-    summary_lines.append(data["treatment_text"] if data["treatment_text"] else "brak danych")
+    if treatment_lines:
+        for line in treatment_lines:
+            summary_lines.append(f"• {line}")
+    else:
+        summary_lines.append("• brak danych")
     summary_lines.append("")
+
     summary_lines.append("Wywiad / zdarzenia")
     summary_lines.append(
-        f"Zakrzepica: {'tak' if data['hx_thrombosis'] else 'nie'}, "
-        f"Krwawienie: {'tak' if data['hx_bleeding'] else 'nie'}, "
-        f"Śledziona / splenomegalia: {'tak' if data['hx_spleen'] else 'nie'}, "
+        f"Zakrzepica: {'tak' if data['hx_thrombosis'] else 'nie'} | "
+        f"Krwawienie: {'tak' if data['hx_bleeding'] else 'nie'} | "
+        f"Śledziona / splenomegalia: {'tak' if data['hx_spleen'] else 'nie'} | "
         f"Palenie: {'tak' if data['hx_smoking'] else 'nie'}"
     )
+    if data["other_events_text"].strip():
+        summary_lines.append(f"Inne zdarzenia: {data['other_events_text'].strip()}")
     summary_lines.append("")
+
     summary_lines.append("Objawy")
     symptom_names = [k.replace("_", " ") for k, v in data["symptoms"].items() if v]
     summary_lines.append(", ".join(symptom_names) if symptom_names else "brak zaznaczonych objawów")
-    if data["other_symptoms_text"]:
-        summary_lines.append(f"Inne objawy: {data['other_symptoms_text']}")
+    if data["other_symptoms_text"].strip():
+        summary_lines.append(f"Inne objawy: {data['other_symptoms_text'].strip()}")
     summary_lines.append("")
+
     summary_lines.append("Aktualne parametry")
     summary_lines.append(
         f"Hct {current_hct}, Hb {current_hb}, WBC {current_wbc}, PLT {current_plt}, "
         f"LDH {current_ldh}, kwas moczowy {current_uric}, ferrytyna {current_ferritin}"
     )
     summary_lines.append("")
+
     summary_lines.append("Trendy")
     summary_lines.append(f"Hct: {hct_trend}")
     summary_lines.append(f"Hb: {hb_trend}")
@@ -714,8 +787,13 @@ def build_analysis(data):
         f"Tempo zmiany Hct: {hct_slope:.2f} % / mies." if hct_slope is not None else "Tempo zmiany Hct: za mało danych"
     )
     summary_lines.append("")
+
     summary_lines.append("Upusty")
     summary_lines.append(phleb_frequency_text(avg_interval))
+    summary_lines.append(f"Liczba upustów w bieżącym roku: {phleb_count_year}")
+    summary_lines.append(f"Łączna objętość upustów w bieżącym roku: {phleb_ml_year} ml")
+    if phleb_avg_interval is not None:
+        summary_lines.append(f"Średni odstęp między upustami: {phleb_avg_interval:.1f} dni")
     if days_to_recross is not None:
         if current_hct < TARGET_HCT and days_to_recross > 0:
             est_date = date.today() + timedelta(days=days_to_recross)
@@ -725,6 +803,7 @@ def build_analysis(data):
         elif current_hct >= TARGET_HCT:
             summary_lines.append("Hct aktualnie pozostaje na poziomie co najmniej 45%.")
     summary_lines.append("")
+
     summary_lines.append("Czerwone flagi")
     if flags:
         for item in flags:
@@ -732,13 +811,15 @@ def build_analysis(data):
     else:
         summary_lines.append("• brak istotnych flag")
     summary_lines.append("")
+
     summary_lines.append("Ostrzeżenia lekowe")
     if drug_alerts:
         for item in drug_alerts:
             summary_lines.append(f"• {item}")
     else:
-        summary_lines.append("• brak istotnych ostrzeżeń")
+        summary_lines.append("• brak istotnych ostrzeżeń wykrytych lokalnie")
     summary_lines.append("")
+
     summary_lines.append("Zalecenia robocze")
     if recommendations:
         for item in recommendations:
@@ -751,19 +832,63 @@ def build_analysis(data):
 
     summary = "\n".join(summary_lines)
 
-    note = (
-        f"Wizyta kontrolna. Pacjent ID {data['patient_id'] or 'brak'}. "
-        f"Rozpoznania: {data['diagnoses_text'] if data['diagnoses_text'] else 'brak danych'}. "
-        f"Historia choroby: {data['history_text'] if data['history_text'] else 'brak danych'}. "
-        f"Aktualne leczenie: {data['treatment_text'] if data['treatment_text'] else 'brak danych'}. "
-        f"Aktualne badania: Hct {current_hct}, Hb {current_hb}, WBC {current_wbc}, PLT {current_plt}, "
-        f"LDH {current_ldh}, kwas moczowy {current_uric}, ferrytyna {current_ferritin}. "
-        f"Orientacyjny kolejny upust do rozważenia: {next_ml} ml. "
-        f"Ocena cytoredukcji: {cyto_conclusion}. "
-        f"Flagi: {', '.join(flags) if flags else 'brak istotnych flag'}."
-    )
+    note_lines = []
+    note_lines.append("NOTATKA DO DOKUMENTACJI")
+    note_lines.append("")
+    note_lines.append(f"Pacjent ID: {data['patient_id'] or 'brak'}")
+    note_lines.append(f"Wiek: {data['age']} lat, płeć: {data['sex']}")
+    note_lines.append(f"Rozpoznania:")
+    if diagnosis_lines:
+        for line in diagnosis_lines:
+            note_lines.append(f"- {line}")
+    else:
+        note_lines.append("- brak danych")
 
-    compare_two = build_compare_two_last_entered(cbc_rows)
+    note_lines.append("Historia choroby:")
+    if history_lines:
+        for line in history_lines:
+            note_lines.append(f"- {line}")
+    else:
+        note_lines.append("- brak danych")
+
+    note_lines.append("Aktualne leczenie:")
+    if treatment_lines:
+        for line in treatment_lines:
+            note_lines.append(f"- {line}")
+    else:
+        note_lines.append("- brak danych")
+
+    note_lines.append(
+        f"Wywiad / zdarzenia: zakrzepica {'tak' if data['hx_thrombosis'] else 'nie'}, "
+        f"krwawienie {'tak' if data['hx_bleeding'] else 'nie'}, "
+        f"śledziona {'tak' if data['hx_spleen'] else 'nie'}, "
+        f"palenie {'tak' if data['hx_smoking'] else 'nie'}."
+    )
+    if data["other_events_text"].strip():
+        note_lines.append(f"Inne zdarzenia: {data['other_events_text'].strip()}")
+
+    symptom_names_text = ", ".join([k.replace("_", " ") for k, v in data["symptoms"].items() if v])
+    note_lines.append(f"Objawy: {symptom_names_text if symptom_names_text else 'brak zaznaczonych objawów'}.")
+    if data["other_symptoms_text"].strip():
+        note_lines.append(f"Inne objawy: {data['other_symptoms_text'].strip()}")
+
+    note_lines.append(
+        f"Aktualne badania: Hct {current_hct}, Hb {current_hb}, WBC {current_wbc}, "
+        f"PLT {current_plt}, LDH {current_ldh}, kwas moczowy {current_uric}, ferrytyna {current_ferritin}."
+    )
+    note_lines.append(
+        f"Upusty w bieżącym roku: {phleb_count_year}, łącznie {phleb_ml_year} ml."
+    )
+    note_lines.append(
+        f"Orientacyjny kolejny upust do rozważenia: {next_ml} ml."
+    )
+    note_lines.append(f"Ocena cytoredukcji: {cyto_conclusion}.")
+    if flags:
+        note_lines.append(f"Flagi: {', '.join(flags)}.")
+    if drug_alerts:
+        note_lines.append(f"Ostrzeżenia lekowe: {'; '.join(drug_alerts)}.")
+
+    note = "\n".join(note_lines)
 
     current_status = "poza celem" if current_hct is not None and current_hct > TARGET_HCT else "w celu"
 
@@ -775,7 +900,11 @@ def build_analysis(data):
         "next_ml": next_ml,
         "current_hct": current_hct,
         "current_status": current_status,
-        "compare_two": compare_two,
+        "compare_four": compare_four,
+        "phleb_count_year": phleb_count_year,
+        "phleb_ml_year": phleb_ml_year,
+        "phleb_avg_interval": phleb_avg_interval,
+        "phleb_table": phleb_table,
     }
 
 
@@ -787,278 +916,271 @@ init_state()
 
 st.title(APP_TITLE)
 
-top1, top2, top3 = st.columns([2, 1, 1])
+st.text_input("Pacjent / ID", key="patient_id")
 
-with top1:
-    st.text_input("Pacjent / ID", key="patient_id")
-
-with top2:
-    st.button("Wyczyść formularz", on_click=clear_form, use_container_width=True)
+st.button("Wyczyść cały formularz", on_click=clear_form, use_container_width=True)
 
 history_df = load_patient_history(st.session_state["patient_id"])
+if not history_df.empty:
+    st.success(f"Zapisane wizyty tego pacjenta: {len(history_df)}")
+else:
+    st.info("Brak zapisanych wizyt dla tego ID")
 
-with top3:
-    if not history_df.empty:
-        st.success(f"Historia wizyt: {len(history_df)}")
-    else:
-        st.info("Brak zapisanych wizyt")
+st.subheader("Dane podstawowe")
+st.number_input("Wiek", min_value=0, max_value=120, key="age")
+st.selectbox("Płeć", ["M", "K", "inna / niepodano"], key="sex")
+st.number_input("Masa ciała (kg)", min_value=20.0, max_value=300.0, key="weight")
+st.number_input("Wzrost (cm)", min_value=100.0, max_value=250.0, key="height")
 
-left, right = st.columns([1.05, 1.25])
+bmi = bmi_calc(st.session_state["weight"], st.session_state["height"])
+st.info(f"BMI: {bmi:.1f} ({bmi_class(bmi)})" if bmi is not None else "BMI: brak danych")
 
-with left:
-    st.subheader("Dane podstawowe")
+st.subheader("Rozpoznania")
+st.text_area(
+    "Rozpoznania",
+    key="diagnoses_text",
+    height=100,
+    label_visibility="collapsed",
+    placeholder="Każde rozpoznanie wpisz w osobnej linii"
+)
 
-    a1, a2 = st.columns(2)
-    a1.number_input("Wiek", min_value=0, max_value=120, key="age")
-    a2.selectbox("Płeć", ["M", "K", "inna / niepodano"], key="sex")
+st.subheader("Historia choroby")
+st.text_area(
+    "Historia choroby",
+    key="history_text",
+    height=120,
+    label_visibility="collapsed",
+    placeholder="Najważniejsze informacje o przebiegu choroby, leczeniu, zdarzeniach"
+)
 
-    a3, a4 = st.columns(2)
-    a3.number_input("Masa ciała (kg)", min_value=20.0, max_value=300.0, key="weight")
-    a4.number_input("Wzrost (cm)", min_value=100.0, max_value=250.0, key="height")
+st.subheader("Aktualne leczenie")
+st.text_area(
+    "Aktualne leczenie",
+    key="treatment_text",
+    height=120,
+    label_visibility="collapsed",
+    placeholder="Każdy lek i dawkowanie wpisz w osobnej linii"
+)
 
-    bmi = bmi_calc(st.session_state["weight"], st.session_state["height"])
-    st.info(f"BMI: {bmi:.1f} ({bmi_class(bmi)})" if bmi is not None else "BMI: brak danych")
+st.subheader("Wywiad / zdarzenia")
+st.checkbox("Przebyta zakrzepica", key="hx_thrombosis")
+st.checkbox("Przebyte krwawienie", key="hx_bleeding")
+st.checkbox("Splenomegalia / objawy śledzionowe", key="hx_spleen")
+st.checkbox("Palenie", key="hx_smoking")
+st.text_area(
+    "Inne zdarzenia",
+    key="other_events_text",
+    height=80,
+    placeholder="Wpisz inne ważne zdarzenia"
+)
 
-    st.subheader("Rozpoznania")
-    st.text_area(
-        "Rozpoznania",
-        key="diagnoses_text",
-        height=100,
-        label_visibility="collapsed",
-        placeholder="Np. Czerwienica prawdziwa JAK2+, NT, migotanie przedsionków..."
-    )
+st.subheader("Objawy")
+st.checkbox("Świąd", key="symptom_itch")
+st.checkbox("Ból głowy", key="symptom_headache")
+st.checkbox("Erytromelalgia", key="symptom_erythromelalgia")
+st.checkbox("Zawroty głowy", key="symptom_dizziness")
+st.checkbox("Objawy mikrokrążeniowe", key="symptom_micro")
+st.checkbox("Nocne poty", key="symptom_nightsweats")
+st.checkbox("Spadek masy ciała", key="symptom_weightloss")
+st.text_area(
+    "Inne objawy",
+    key="other_symptoms_text",
+    height=80,
+    placeholder="Wpisz inne objawy"
+)
 
-    st.subheader("Historia choroby")
-    st.text_area(
-        "Historia choroby",
-        key="history_text",
-        height=120,
-        label_visibility="collapsed",
-        placeholder="Przebieg choroby, wcześniejsze leczenie, ważne zdarzenia..."
-    )
+st.subheader("4 ostatnie badania")
+cbc_rows = []
+for i in range(4):
+    st.markdown(f"**Badanie {i+1}**")
+    st.date_input("Data", key=f"cbc_date_{i}")
+    st.number_input("Hct", min_value=20.0, max_value=80.0, key=f"cbc_hct_{i}")
+    st.number_input("Hb", min_value=5.0, max_value=25.0, key=f"cbc_hb_{i}")
+    st.number_input("WBC", min_value=0.0, max_value=200.0, key=f"cbc_wbc_{i}")
+    st.number_input("PLT", min_value=0.0, max_value=3000.0, key=f"cbc_plt_{i}")
+    st.number_input("LDH", min_value=0.0, max_value=3000.0, key=f"cbc_ldh_{i}")
+    st.number_input("Kwas moczowy", min_value=0.0, max_value=20.0, key=f"cbc_uric_{i}")
+    st.number_input("Ferrytyna", min_value=0.0, max_value=2000.0, key=f"cbc_ferr_{i}")
+    st.number_input("Kreatynina", min_value=0.0, max_value=10.0, key=f"cbc_creat_{i}")
+    st.number_input("RDW", min_value=0.0, max_value=40.0, key=f"cbc_rdw_{i}")
+    st.number_input("Beta-2-mikroglobulina", min_value=0.0, max_value=20.0, key=f"cbc_b2m_{i}")
 
-    st.subheader("Aktualne leczenie")
-    st.text_area(
-        "Aktualne leczenie",
-        key="treatment_text",
-        height=100,
-        label_visibility="collapsed",
-        placeholder="Np. Acard 75 mg, hydroksymocznik, apiksaban..."
-    )
+    cbc_rows.append({
+        "date": st.session_state[f"cbc_date_{i}"],
+        "hct": safe_float(st.session_state[f"cbc_hct_{i}"]),
+        "hb": safe_float(st.session_state[f"cbc_hb_{i}"]),
+        "wbc": safe_float(st.session_state[f"cbc_wbc_{i}"]),
+        "plt": safe_float(st.session_state[f"cbc_plt_{i}"]),
+        "ldh": safe_float(st.session_state[f"cbc_ldh_{i}"]),
+        "uric_acid": safe_float(st.session_state[f"cbc_uric_{i}"]),
+        "ferritin": safe_float(st.session_state[f"cbc_ferr_{i}"]),
+        "creatinine": safe_float(st.session_state[f"cbc_creat_{i}"]),
+        "rdw": safe_float(st.session_state[f"cbc_rdw_{i}"]),
+        "beta2m": safe_float(st.session_state[f"cbc_b2m_{i}"]),
+    })
+    st.markdown("---")
 
-    st.subheader("Wywiad / zdarzenia")
-    b1, b2 = st.columns(2)
-    b1.checkbox("Przebyta zakrzepica", key="hx_thrombosis")
-    b1.checkbox("Przebyte krwawienie", key="hx_bleeding")
-    b2.checkbox("Splenomegalia / objawy śledzionowe", key="hx_spleen")
-    b2.checkbox("Palenie", key="hx_smoking")
+st.subheader("4 ostatnie upusty")
+phleb_rows = []
+for i in range(4):
+    st.markdown(f"**Upust {i+1}**")
+    st.date_input("Data upustu", key=f"ph_date_{i}")
+    st.number_input("Objętość ml", min_value=0, max_value=1000, step=25, key=f"ph_ml_{i}")
+    phleb_rows.append({
+        "date": st.session_state[f"ph_date_{i}"],
+        "ml": st.session_state[f"ph_ml_{i}"],
+    })
+    st.markdown("---")
 
-    st.subheader("Objawy")
-    c1, c2 = st.columns(2)
-    c1.checkbox("Świąd", key="symptom_itch")
-    c1.checkbox("Ból głowy", key="symptom_headache")
-    c1.checkbox("Erytromelalgia", key="symptom_erythromelalgia")
-    c2.checkbox("Zawroty głowy", key="symptom_dizziness")
-    c2.checkbox("Objawy mikrokrążeniowe", key="symptom_micro")
-    c2.checkbox("Nocne poty", key="symptom_nightsweats")
+if st.button("Analizuj wizytę", type="primary", use_container_width=True):
+    data = {
+        "patient_id": st.session_state["patient_id"],
+        "age": int(st.session_state["age"]),
+        "sex": st.session_state["sex"],
+        "weight": float(st.session_state["weight"]),
+        "height": float(st.session_state["height"]),
+        "diagnoses_text": st.session_state["diagnoses_text"],
+        "history_text": st.session_state["history_text"],
+        "treatment_text": st.session_state["treatment_text"],
+        "hx_thrombosis": st.session_state["hx_thrombosis"],
+        "hx_bleeding": st.session_state["hx_bleeding"],
+        "hx_spleen": st.session_state["hx_spleen"],
+        "hx_smoking": st.session_state["hx_smoking"],
+        "other_events_text": st.session_state["other_events_text"],
+        "other_symptoms_text": st.session_state["other_symptoms_text"],
+        "cbc_rows": cbc_rows,
+        "phleb_rows": phleb_rows,
+        "symptoms": {
+            "świąd": st.session_state["symptom_itch"],
+            "ból_głowy": st.session_state["symptom_headache"],
+            "erytromelalgia": st.session_state["symptom_erythromelalgia"],
+            "zawroty": st.session_state["symptom_dizziness"],
+            "mikrokrążenie": st.session_state["symptom_micro"],
+            "nocne_poty": st.session_state["symptom_nightsweats"],
+            "spadek_masy": st.session_state["symptom_weightloss"],
+        },
+    }
 
-    st.checkbox("Spadek masy ciała", key="symptom_weightloss")
-    st.text_area(
-        "Inne objawy",
-        key="other_symptoms_text",
-        height=80,
-        placeholder="Wpisz inne objawy"
-    )
+    result = build_analysis(data)
 
-    with st.expander("4 kolejne badania", expanded=True):
-        cbc_rows = []
-        for i in range(4):
-            st.markdown(f"**Badanie {i+1}**")
-            r1 = st.columns(4)
-            r2 = st.columns(4)
-            r3 = st.columns(3)
+    st.session_state["analysis_ready"] = True
+    st.session_state["last_summary"] = result["summary"]
+    st.session_state["last_note"] = result["note"]
+    st.session_state["last_flags"] = result["flags"]
+    st.session_state["last_drug_alerts"] = result["drug_alerts"]
+    st.session_state["last_next_ml"] = result["next_ml"]
+    st.session_state["last_current_hct"] = result["current_hct"]
+    st.session_state["last_current_status"] = result["current_status"]
+    st.session_state["last_compare_rows"] = result["compare_four"]
+    st.session_state["last_phleb_count_year"] = result["phleb_count_year"]
+    st.session_state["last_phleb_ml_year"] = result["phleb_ml_year"]
+    st.session_state["last_phleb_avg_interval"] = result["phleb_avg_interval"]
+    st.session_state["last_phleb_table"] = result["phleb_table"]
+    st.session_state["last_data"] = data
 
-            r1[0].date_input("Data", key=f"cbc_date_{i}")
-            r1[1].number_input("Hct", min_value=20.0, max_value=80.0, key=f"cbc_hct_{i}")
-            r1[2].number_input("Hb", min_value=5.0, max_value=25.0, key=f"cbc_hb_{i}")
-            r1[3].number_input("WBC", min_value=0.0, max_value=200.0, key=f"cbc_wbc_{i}")
-
-            r2[0].number_input("PLT", min_value=0.0, max_value=3000.0, key=f"cbc_plt_{i}")
-            r2[1].number_input("LDH", min_value=0.0, max_value=3000.0, key=f"cbc_ldh_{i}")
-            r2[2].number_input("Kwas moczowy", min_value=0.0, max_value=20.0, key=f"cbc_uric_{i}")
-            r2[3].number_input("Ferrytyna", min_value=0.0, max_value=2000.0, key=f"cbc_ferr_{i}")
-
-            r3[0].number_input("Kreatynina", min_value=0.0, max_value=10.0, key=f"cbc_creat_{i}")
-            r3[1].number_input("RDW", min_value=0.0, max_value=40.0, key=f"cbc_rdw_{i}")
-            r3[2].number_input("Beta-2-mikroglobulina", min_value=0.0, max_value=20.0, key=f"cbc_b2m_{i}")
-
-            cbc_rows.append({
-                "date": st.session_state[f"cbc_date_{i}"],
-                "hct": safe_float(st.session_state[f"cbc_hct_{i}"]),
-                "hb": safe_float(st.session_state[f"cbc_hb_{i}"]),
-                "wbc": safe_float(st.session_state[f"cbc_wbc_{i}"]),
-                "plt": safe_float(st.session_state[f"cbc_plt_{i}"]),
-                "ldh": safe_float(st.session_state[f"cbc_ldh_{i}"]),
-                "uric_acid": safe_float(st.session_state[f"cbc_uric_{i}"]),
-                "ferritin": safe_float(st.session_state[f"cbc_ferr_{i}"]),
-                "creatinine": safe_float(st.session_state[f"cbc_creat_{i}"]),
-                "rdw": safe_float(st.session_state[f"cbc_rdw_{i}"]),
-                "beta2m": safe_float(st.session_state[f"cbc_b2m_{i}"]),
-            })
-
-    with st.expander("4 ostatnie upusty", expanded=True):
-        phleb_rows = []
-        for i in range(4):
-            p1, p2 = st.columns(2)
-            p1.date_input("Data upustu", key=f"ph_date_{i}")
-            p2.number_input("Objętość ml", min_value=0, max_value=1000, step=25, key=f"ph_ml_{i}")
-            phleb_rows.append({
-                "date": st.session_state[f"ph_date_{i}"],
-                "ml": st.session_state[f"ph_ml_{i}"],
-            })
-
-with right:
+if st.session_state.get("analysis_ready", False):
     st.subheader("Analiza")
 
-    if st.button("Analizuj wizytę", type="primary", use_container_width=True):
-        data = {
-            "patient_id": st.session_state["patient_id"],
-            "age": int(st.session_state["age"]),
-            "sex": st.session_state["sex"],
-            "weight": float(st.session_state["weight"]),
-            "height": float(st.session_state["height"]),
-            "diagnoses_text": st.session_state["diagnoses_text"],
-            "history_text": st.session_state["history_text"],
-            "treatment_text": st.session_state["treatment_text"],
-            "hx_thrombosis": st.session_state["hx_thrombosis"],
-            "hx_bleeding": st.session_state["hx_bleeding"],
-            "hx_spleen": st.session_state["hx_spleen"],
-            "hx_smoking": st.session_state["hx_smoking"],
-            "other_symptoms_text": st.session_state["other_symptoms_text"],
-            "cbc_rows": sorted(cbc_rows, key=lambda x: x["date"]),
-            "phleb_rows": sorted(phleb_rows, key=lambda x: x["date"]),
-            "symptoms": {
-                "świąd": st.session_state["symptom_itch"],
-                "ból_głowy": st.session_state["symptom_headache"],
-                "erytromelalgia": st.session_state["symptom_erythromelalgia"],
-                "zawroty": st.session_state["symptom_dizziness"],
-                "mikrokrążenie": st.session_state["symptom_micro"],
-                "nocne_poty": st.session_state["symptom_nightsweats"],
-                "spadek_masy": st.session_state["symptom_weightloss"],
-            },
-        }
+    st.metric("Hct aktualnie", f"{st.session_state['last_current_hct']:.1f}%" if st.session_state["last_current_hct"] is not None else "brak")
+    st.metric("Kolejny upust do rozważenia", f"{st.session_state['last_next_ml']} ml")
+    st.metric("Status kontroli", st.session_state["last_current_status"])
+    st.metric("Upusty w roku", f"{st.session_state['last_phleb_count_year']}")
 
-        result = build_analysis(data)
+    st.metric("Łączna objętość upustów w roku", f"{st.session_state['last_phleb_ml_year']} ml")
+    if st.session_state["last_phleb_avg_interval"] is not None:
+        st.metric("Średni odstęp między upustami", f"{st.session_state['last_phleb_avg_interval']:.1f} dni")
 
-        st.session_state["analysis_ready"] = True
-        st.session_state["last_summary"] = result["summary"]
-        st.session_state["last_note"] = result["note"]
-        st.session_state["last_flags"] = result["flags"]
-        st.session_state["last_drug_alerts"] = result["drug_alerts"]
-        st.session_state["last_next_ml"] = result["next_ml"]
-        st.session_state["last_current_hct"] = result["current_hct"]
-        st.session_state["last_current_status"] = result["current_status"]
-        st.session_state["last_compare_rows"] = result["compare_two"]
-        st.session_state["last_data"] = data
+    if st.session_state["last_flags"]:
+        st.markdown("### Czerwone flagi")
+        for f in st.session_state["last_flags"]:
+            st.error(f)
 
-    if st.session_state.get("analysis_ready", False):
-        m1, m2, m3, m4 = st.columns(4)
-        current_hct = st.session_state["last_current_hct"]
-        next_ml = st.session_state["last_next_ml"]
-        flags = st.session_state["last_flags"]
+    st.markdown("### Interakcje lekowe i ostrzeżenia")
+    if st.session_state["last_drug_alerts"]:
+        for a in st.session_state["last_drug_alerts"]:
+            st.warning(a)
+    else:
+        st.info("Brak istotnych ostrzeżeń wykrytych lokalnie.")
 
-        m1.metric("Hct aktualnie", f"{current_hct:.1f}%" if current_hct is not None else "brak")
-        m2.metric("Kolejny upust do rozważenia", f"{next_ml} ml")
-        m3.metric("Czerwone flagi", str(len(flags)))
-        m4.metric("Status kontroli", st.session_state["last_current_status"])
+    st.markdown("Sprawdź interakcje także zewnętrznie:")
+    st.markdown(
+        """
+- [Drugs.com Interaction Checker](https://www.drugs.com/drug_interactions.html)
+- [Medscape Drug Interaction Checker](https://reference.medscape.com/drug-interactionchecker)
+"""
+    )
 
-        if flags:
-            st.markdown("### Czerwone flagi")
-            for f in flags:
-                st.error(f)
+    st.markdown("### Porównanie 4 ostatnich badań")
+    compare_df = st.session_state["last_compare_rows"]
+    if isinstance(compare_df, pd.DataFrame) and not compare_df.empty:
+        st.dataframe(compare_df, use_container_width=True)
 
-        if st.session_state["last_drug_alerts"]:
-            st.markdown("### Ostrzeżenia lekowe")
-            for a in st.session_state["last_drug_alerts"]:
-                st.warning(a)
+    st.markdown("### Tabela upustów")
+    phleb_table = st.session_state["last_phleb_table"]
+    if isinstance(phleb_table, pd.DataFrame) and not phleb_table.empty:
+        st.dataframe(phleb_table, use_container_width=True)
 
-        st.markdown("### Porównanie 2 ostatnich wprowadzonych badań")
-        compare_df = st.session_state["last_compare_rows"]
-        if isinstance(compare_df, pd.DataFrame) and not compare_df.empty:
-            st.dataframe(compare_df, use_container_width=True)
+    st.markdown("### Podsumowanie lekarskie")
+    st.text_area(
+        "summary_box",
+        value=st.session_state["last_summary"],
+        height=500,
+        label_visibility="collapsed",
+    )
+
+    st.markdown("### Notatka do wydruku / dokumentacji")
+    st.text_area(
+        "note_box",
+        value=st.session_state["last_note"],
+        height=320,
+        label_visibility="collapsed",
+    )
+
+    if st.button("Zapisz wizytę do historii", use_container_width=True):
+        if st.session_state["last_data"]["patient_id"]:
+            record = visit_to_record(
+                st.session_state["last_data"],
+                st.session_state["last_summary"],
+                st.session_state["last_next_ml"],
+            )
+            append_visit_to_csv(record)
+            st.success("Wizyta zapisana.")
         else:
-            st.info("Za mało danych do porównania.")
+            st.error("Najpierw wpisz ID pacjenta.")
 
-        st.markdown("### Podsumowanie lekarskie")
-        st.text_area(
-            "summary_box",
-            value=st.session_state["last_summary"],
-            height=350,
-            label_visibility="collapsed",
-        )
+    pdf_bytes = make_pdf_bytes("PV Assistant - podsumowanie", st.session_state["last_summary"])
+    st.download_button(
+        "Pobierz PDF",
+        data=pdf_bytes,
+        file_name="pv_podsumowanie.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+    )
 
-        st.markdown("### Notatka do dokumentacji")
-        st.text_area(
-            "note_box",
-            value=st.session_state["last_note"],
-            height=160,
-            label_visibility="collapsed",
-        )
-
-        d1, d2, d3 = st.columns(3)
-
-        with d1:
-            if st.button("Zapisz wizytę do historii", use_container_width=True):
-                if st.session_state["last_data"]["patient_id"]:
-                    record = visit_to_record(
-                        st.session_state["last_data"],
-                        st.session_state["last_summary"],
-                        st.session_state["last_next_ml"],
-                    )
-                    append_visit_to_csv(record)
-                    st.success("Wizyta zapisana.")
-                else:
-                    st.error("Najpierw wpisz ID pacjenta.")
-
-        with d2:
-            pdf_bytes = make_pdf_bytes("PV Assistant - podsumowanie", st.session_state["last_summary"])
-            st.download_button(
-                "Pobierz PDF",
-                data=pdf_bytes,
-                file_name="pv_podsumowanie.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-            )
-
-        with d3:
-            st.download_button(
-                "Pobierz TXT",
-                data=st.session_state["last_summary"].encode("utf-8"),
-                file_name="pv_podsumowanie.txt",
-                mime="text/plain",
-                use_container_width=True,
-            )
+    st.download_button(
+        "Pobierz TXT",
+        data=st.session_state["last_summary"].encode("utf-8"),
+        file_name="pv_podsumowanie.txt",
+        mime="text/plain",
+        use_container_width=True,
+    )
 
 if st.session_state["patient_id"]:
     st.markdown("---")
-    st.subheader("Historia wizyt tego pacjenta")
+    st.subheader("Historia zapisanych wizyt tego pacjenta")
 
     if history_df.empty:
         st.info("Brak zapisanych wizyt dla tego ID.")
     else:
-        h1, h2 = st.columns([1, 1])
+        st.dataframe(history_df.tail(10), use_container_width=True)
 
-        with h1:
-            st.dataframe(history_df.tail(10), use_container_width=True)
-
-        with h2:
-            st.markdown("### Porównanie z poprzednią zapisaną wizytą")
-            compare_prev = compare_with_previous_visit(history_df)
-            if compare_prev:
-                for line in compare_prev:
-                    st.write(line)
-            else:
-                st.write("Za mało zapisanych wizyt do porównania.")
+        st.markdown("### Porównanie z poprzednią zapisaną wizytą")
+        compare_prev = compare_with_previous_visit(history_df)
+        if compare_prev:
+            for line in compare_prev:
+                st.write(line)
+        else:
+            st.write("Za mało zapisanych wizyt do porównania.")
 
         if "visit_date" in history_df.columns:
             plot_df = history_df.copy()
@@ -1066,5 +1188,5 @@ if st.session_state["patient_id"]:
             plot_df = plot_df.set_index("visit_date")
             cols_to_plot = [c for c in ["hct", "hb", "wbc", "plt", "ldh", "uric_acid", "ferritin"] if c in plot_df.columns]
             if cols_to_plot:
-                st.markdown("### Trendy z zapisanych wizyt")
+                st.markdown("### Trendy zapisanych wizyt")
                 st.line_chart(plot_df[cols_to_plot])
