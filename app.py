@@ -266,7 +266,7 @@ def persistent_above_target(values, n_needed=2):
     vals = [v for v in values if v is not None]
     if len(vals) < n_needed:
         return False
-    return all(v > TARGET_HCT for v in vals[-n_needed:]
+    return all(v > TARGET_HCT for v in vals[-n_needed:])
 
 
 def parse_treatment_flags(text: str):
