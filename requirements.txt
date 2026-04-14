@@ -1,3 +1,6 @@
 streamlit
 pandas
 reportlab
+pymupdf
+pillow
+pytesseract
